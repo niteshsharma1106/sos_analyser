@@ -59,29 +59,30 @@ def main() -> None:
             report = investigate_prompt_offline(db_path=args.db_path, prompt=args.prompt)
         else:
             try:
-                report = investigate_prompt_with_langchain(
-                    db_path=args.db_path,
-                    prompt=args.prompt,
-                    model=args.model,
-                )
+                print(f"User Prompt: {args.prompt}")
+                # report = investigate_prompt_with_langchain(
+                #     db_path=args.db_path,
+                #     prompt=args.prompt,
+                #     model=args.model,
+                # )
             except MissingLLMConfiguration as exc:
                 raise SystemExit(str(exc)) from exc
-        print(report.render_markdown())
+        # print(report.render_markdown())
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] == "ingest":
-        argv = sys.argv[2:]
-    else:
-        argv = sys.argv[1:]
+    # if len(sys.argv) > 1 and sys.argv[1] == "ingest":
+    #     argv = sys.argv[2:]
+    # else:
+    #     argv = sys.argv[1:]
 
-    args = build_ingest_parser().parse_args(argv)
-    db_path = ingest_sos_reports(
-        reports_dir=args.reports_dir,
-        db_path=args.db_path,
-        clear_existing=args.clear_existing,
-        max_file_size_mb=args.max_file_size_mb,
-    )
-    print(f"Ingestion complete. Database: {db_path}")
+    # args = build_ingest_parser().parse_args(argv)
+    # db_path = ingest_sos_reports(
+    #     reports_dir=args.reports_dir,
+    #     db_path=args.db_path,
+    #     clear_existing=args.clear_existing,
+    #     max_file_size_mb=args.max_file_size_mb,
+    # )
+    # print(f"Ingestion complete. Database: {db_path}")
 
 
 if __name__ == "__main__":
