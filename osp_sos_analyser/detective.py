@@ -72,6 +72,10 @@ def investigate_prompt(db_path: str | Path, prompt: str) -> InvestigationReport:
     return DetectiveCoordinator(db_path).investigate(prompt)
 
 
+def investigate_prompt_offline(db_path: str | Path, prompt: str) -> InvestigationReport:
+    return DetectiveCoordinator(db_path).investigate(prompt)
+
+
 def _timeline_services(
     hints: EvidenceHint, findings: tuple[AgentFinding, ...]
 ) -> tuple[str, ...]:

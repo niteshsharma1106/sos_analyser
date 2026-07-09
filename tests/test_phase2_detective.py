@@ -9,6 +9,8 @@ import duckdb
 
 from osp_sos_analyser.db import ensure_schema, insert_commands, insert_logs
 from osp_sos_analyser.detective import investigate_prompt
+from osp_sos_analyser.langchain_detective import investigate_prompt_with_langchain
+from osp_sos_analyser.llm_client import MissingLLMConfiguration
 from osp_sos_analyser.models import CommandArtifact, LogEntry
 
 
@@ -145,6 +147,22 @@ class DetectivePhase2Tests(unittest.TestCase):
             self.assertNotIn("System/Podman Agent", rendered)
             self.assertIn("Instance fd27c003-5b78-4abb-a85a-aa90973f7ff0 is not ready", rendered)
             self.assertNotIn("AMQP server is unreachable", "\n".join(event.message for event in report.timeline))
+
+    def test_langchain_agent_requires_api_key_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.duckdb"
+            with duckdb.connect(str(db_path)) as conn:
+                ensure_schema(conn)
+
+            import os
+
+            old_key = os.environ.pop("OPENAI_API_KEY", None)
+            try:
+                with self.assertRaises(MissingLLMConfiguration):
+                    investigate_prompt_with_langchain(db_path, "VM failed to create")
+            finally:
+                if old_key is not None:
+                    os.environ["OPENAI_API_KEY"] = old_key
 
 
 if __name__ == "__main__":

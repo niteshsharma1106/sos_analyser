@@ -7,5 +7,9 @@ wheels/
 *.egg-info
 SOS_REPORTS/*
 sos_analysis.*
+.env
+.env.*
+!.env.example
 # Virtual environments
 .venv
+.env

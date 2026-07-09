@@ -50,6 +50,28 @@ To run the Phase 2 detective workflow after ingestion:
 python main.py analyze "VMs on compute-03 suddenly lost network connectivity at 14:00" --db-path sos_analysis.duckdb
 ```
 
+Phase 2 uses a LangChain tool-calling agent by default. Create a local `.env` file first:
+
+```env
+GOOGLE_API_KEY=your-gemini-api-key-here
+OSP_SOS_MODEL=gemini-2.5-pro
+OSP_SOS_MODEL_PROVIDER=google_genai
+```
+
+For OpenAI instead, use `OPENAI_API_KEY` and `OSP_SOS_MODEL_PROVIDER=openai`.
+
+The model is initialized in code with:
+
+```python
+from langchain.chat_models import init_chat_model
+```
+
+For local testing without an LLM, use the deterministic fallback:
+
+```bash
+python main.py analyze "VM fd27c003-5b78-4abb-a85a-aa90973f7ff0 failed to create" --db-path sos_analysis.duckdb --offline
+```
+
 ## Current capabilities
 
 - Reads multiple .tar.xz SOS archives directly
@@ -62,9 +84,9 @@ python main.py analyze "VMs on compute-03 suddenly lost network connectivity at 
 
 ## Phase 2 Plan: Multi-Agent Detective
 
-Phase 2 adds a multi-agent investigation layer on top of the DuckDB data created in Phase 1.
+Phase 2 adds a LangChain multi-agent investigation layer on top of the DuckDB data created in Phase 1.
 
-The current implementation is dependency-light: the agents are deterministic Python specialist components with restricted DuckDB tools. This makes the workflow usable without API keys and keeps the investigation logic testable. The same specialist tools can later be wrapped by LangGraph or LangChain if an LLM-backed workflow is required.
+The default implementation is a LangChain tool-calling Coordinator Agent. It reads the user query, decides which specialist tools to call, chooses search terms from the actual incident context, queries DuckDB, and generates an evidence-backed RCA. A deterministic `--offline` fallback remains available only for local testing without API keys.
 
 The goal is to let a user ask an operational question such as:
 
@@ -74,14 +96,14 @@ VMs on compute-03 suddenly lost network connectivity at 14:00.
 
 The system should understand the problem, identify the likely services involved, dispatch specialist agents, gather evidence from the indexed SOS data, and return a structured root-cause analysis.
 
-### Proposed architecture
+### Implemented architecture
 
 ```text
 User prompt or pasted logs
         |
-Coordinator Agent
+LangChain Coordinator Agent
         |
-Evidence Router
+Dynamic tool selection
         |
 Nova Agent     Neutron/OVN Agent     Cinder Agent     System/Podman Agent
         |
@@ -92,7 +114,7 @@ Final RCA Report
 
 ### Coordinator Agent
 
-The Coordinator Agent reads the initial user question and extracts investigation hints:
+The Coordinator Agent reads the initial user question and decides which tools to call:
 
 - impacted service or symptom
 - hostname or node name
@@ -100,12 +122,12 @@ The Coordinator Agent reads the initial user question and extracts investigation
 - instance ID, port ID, volume ID, request ID, or traceback
 - likely specialist agents to involve
 
-Example routing:
+Example reasoning:
 
 ```text
-network connectivity issue -> Neutron/OVN Agent + Nova Agent + System/Podman Agent
-volume attach failure -> Cinder Agent + Nova Agent
-instance spawn failure -> Nova Agent + Neutron/OVN Agent + Cinder Agent
+network connectivity issue -> call network, nova, and maybe system tools
+volume attach failure -> call cinder and nova tools
+instance spawn failure -> call nova and network tools, then cinder only if volume context appears
 ```
 
 ### Evidence Router
@@ -153,9 +175,9 @@ System/Podman Agent responsibilities:
 - identify restarted, failed, or unhealthy service containers
 - provide host and service inventory context
 
-### Deterministic query tools
+### LangChain Tools
 
-Phase 2 includes Python query helpers over DuckDB. Agents call these helpers as tools instead of writing arbitrary SQL directly.
+Phase 2 includes Python query helpers over DuckDB. LangChain exposes them as tools instead of letting the model write arbitrary SQL directly.
 
 Recommended tool modules:
 
@@ -173,6 +195,7 @@ Current implemented modules:
 ```text
 analysis.py          shared DuckDB query helpers
 evidence.py          prompt and pasted-evidence hint extraction
+langchain_detective.py LangChain Coordinator Agent and tool definitions
 nova_tools.py        Nova specialist agent
 network_tools.py     Neutron, OVN, and OVS specialist agent
 cinder_tools.py      Cinder specialist agent
@@ -209,9 +232,9 @@ The final answer should be structured and evidence-backed:
 Completed:
 
 1. Deterministic DuckDB query helpers in analysis.py.
-2. Specialist tool wrappers for Nova, Neutron/OVN, Cinder, and System/Podman.
-3. Prompt hint extraction for services, hosts, timestamps, identifiers, and keywords.
-4. Lightweight Coordinator Agent.
+2. LangChain tool wrappers for Nova, Neutron/OVN, Cinder, System/Podman, timeline, and error summary.
+3. `.env` based secret loading with python-dotenv.
+4. LangChain model initialization through `init_chat_model`.
 5. Correlation timeline generation.
 6. Markdown RCA report generator.
 7. Automated tests for the detective workflow.
@@ -221,4 +244,4 @@ Remaining future enhancements:
 1. Add richer pasted-log block classification.
 2. Add precise time-window filtering for prompts that include timestamps.
 3. Add request ID, instance ID, port ID, and volume ID deep-correlation flows.
-4. Add optional LangGraph orchestration around the existing specialist tools.
+4. Add optional LangGraph orchestration if we need explicit graph state, retries, or human approval checkpoints.

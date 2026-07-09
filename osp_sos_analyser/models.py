@@ -96,6 +96,11 @@ class InvestigationReport:
     findings: tuple[AgentFinding, ...]
     timeline: tuple[LogRecord, ...]
     error_summary: tuple[tuple[str, str, int], ...]
+    final_summary: str | None = None
+    final_root_cause: str | None = None
+    final_confidence: str | None = None
+    final_timeline_analysis: str | None = None
+    final_recommendations: tuple[str, ...] = ()
 
     def render_markdown(self) -> str:
         lines = [
@@ -103,7 +108,9 @@ class InvestigationReport:
             "",
             "## Summary",
         ]
-        if self.findings:
+        if self.final_summary:
+            lines.append(f"- {self.final_summary}")
+        elif self.findings:
             for finding in self.findings:
                 lines.append(f"- {finding.agent}: {finding.summary}")
         else:
@@ -123,8 +130,12 @@ class InvestigationReport:
             lines.append("- No ERROR or CRITICAL rows found.")
 
         lines.extend(["", "## Most Likely Root Cause"])
-        lines.append(f"- {self._most_likely_root_cause()}")
-        lines.append(f"- Overall confidence: {self._overall_confidence()}")
+        lines.append(f"- {self.final_root_cause or self._most_likely_root_cause()}")
+        lines.append(f"- Overall confidence: {self.final_confidence or self._overall_confidence()}")
+
+        if self.final_timeline_analysis:
+            lines.extend(["", "## Timeline Analysis"])
+            lines.append(f"- {self.final_timeline_analysis}")
 
         lines.extend(["", "## Timeline"])
         if self.timeline:
@@ -160,6 +171,11 @@ class InvestigationReport:
                 lines.append("- Recommended next checks:")
                 for recommendation in finding.recommendations:
                     lines.append(f"  - {recommendation}")
+
+        if self.final_recommendations:
+            lines.extend(["", "## Final Recommended Next Checks"])
+            for recommendation in self.final_recommendations:
+                lines.append(f"- {recommendation}")
 
         return "\n".join(lines)
 

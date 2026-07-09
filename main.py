@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import sys
 
-from osp_sos_analyser.detective import investigate_prompt
+from osp_sos_analyser.detective import investigate_prompt_offline
 from osp_sos_analyser.ingest import ingest_sos_reports
+from osp_sos_analyser.llm_client import MissingLLMConfiguration
+from osp_sos_analyser.langchain_detective import investigate_prompt_with_langchain
 
 
 def build_ingest_parser() -> argparse.ArgumentParser:
@@ -37,13 +39,33 @@ def build_analyze_parser() -> argparse.ArgumentParser:
         default="sos_analysis.duckdb",
         help="DuckDB database created by the ingestion phase",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="OpenAI model for LLM-backed analysis. Defaults to OSP_SOS_MODEL or gpt-5.5.",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use the old deterministic search workflow without an LLM.",
+    )
     return parser
 
 
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "analyze":
         args = build_analyze_parser().parse_args(sys.argv[2:])
-        report = investigate_prompt(db_path=args.db_path, prompt=args.prompt)
+        if args.offline:
+            report = investigate_prompt_offline(db_path=args.db_path, prompt=args.prompt)
+        else:
+            try:
+                report = investigate_prompt_with_langchain(
+                    db_path=args.db_path,
+                    prompt=args.prompt,
+                    model=args.model,
+                )
+            except MissingLLMConfiguration as exc:
+                raise SystemExit(str(exc)) from exc
         print(report.render_markdown())
         return
 
