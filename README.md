@@ -26,6 +26,9 @@ The current pipeline is modular and supports:
    OR
    ```
    uv run python main.py --reports-dir SOS_REPORTS --db-path sos_analysis.duckdb --clear-existing --max-file-size-mb 25
+
+
+   # python main.py --reports-dir SOS_REPORTS --db-path sos_analysis.duckdb --clear-existing --max-file-size-mb 25
    ```
 
 3. The script will ingest the reports and create a DuckDB database at the requested path.

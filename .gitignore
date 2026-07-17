@@ -13,3 +13,4 @@ sos_analysis.*
 # Virtual environments
 .venv
 .env
+*.duckdb

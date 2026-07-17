@@ -2,11 +2,39 @@ from __future__ import annotations
 
 import argparse
 import sys
+from enum import Enum
+from typing import List, Optional
 
 from osp_sos_analyser.detective import investigate_prompt_offline
 from osp_sos_analyser.ingest import ingest_sos_reports
 from osp_sos_analyser.llm_client import MissingLLMConfiguration
 from osp_sos_analyser.langchain_detective import investigate_prompt_with_langchain
+from pydantic import BaseModel, Field
+
+
+class IncidentType(str, Enum):
+    UNKNOWN = "unknown"
+    VM_CREATE_FAILURE = "vm_create_failure"
+    INSTANCE_FAILURE = "instance_failure"
+    VOLUME_FAILURE = "volume_failure"
+    NETWORK_FAILURE = "network_failure"
+    SERVICE_FAILURE = "service_failure"
+
+
+class InvestigationContext(BaseModel):
+    user_prompt: str
+    incident_type: IncidentType = IncidentType.UNKNOWN
+    symptom: Optional[str] = None
+    affected_host: Optional[str] = None
+    instance_ids: List[str] = Field(default_factory=list)
+    volume_ids: List[str] = Field(default_factory=list)
+    port_ids: List[str] = Field(default_factory=list)
+    request_ids: List[str] = Field(default_factory=list)
+    approximate_time: Optional[str] = None
+    services: List[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    assumptions: List[str] = Field(default_factory=list)
+
 
 
 def build_ingest_parser() -> argparse.ArgumentParser:
@@ -60,6 +88,7 @@ def main() -> None:
         else:
             try:
                 print(f"User Prompt: {args.prompt}")
+
                 # report = investigate_prompt_with_langchain(
                 #     db_path=args.db_path,
                 #     prompt=args.prompt,
@@ -70,19 +99,15 @@ def main() -> None:
         # print(report.render_markdown())
         return
 
-    # if len(sys.argv) > 1 and sys.argv[1] == "ingest":
-    #     argv = sys.argv[2:]
-    # else:
-    #     argv = sys.argv[1:]
-
-    # args = build_ingest_parser().parse_args(argv)
-    # db_path = ingest_sos_reports(
-    #     reports_dir=args.reports_dir,
-    #     db_path=args.db_path,
-    #     clear_existing=args.clear_existing,
-    #     max_file_size_mb=args.max_file_size_mb,
-    # )
-    # print(f"Ingestion complete. Database: {db_path}")
+    argv = sys.argv[1:]
+    args = build_ingest_parser().parse_args(argv)
+    db_path = ingest_sos_reports(
+        reports_dir=args.reports_dir,
+        db_path=args.db_path,
+        clear_existing=args.clear_existing,
+        max_file_size_mb=args.max_file_size_mb,
+    )
+    print(f"Ingestion complete. Database: {db_path}")
 
 
 if __name__ == "__main__":
