@@ -39,8 +39,17 @@ COMMAND_TOKENS = LOG_SERVICE_TOKENS + (
 
 
 def classify_service(module: str, source_file: str) -> tuple[str, str]:
+    source_lower = source_file.lower()
+    # Path-based short-circuit for standalone OVN/OVS processes, which have
+    # their own dedicated log files distinct from neutron-server's own log.
+    ovn_path_markers = ("ovn-metadata-agent.log", "ovn-controller", "openvswitch/", "ovn_controller")
+    if any(marker in source_lower for marker in ovn_path_markers):
+        return "ovn", "networking"
+
     combined = f"{module} {source_file}".lower()
     for service, category, tokens, _tags in SERVICE_RULES:
+        if service == "ovn":
+            continue  # already handled above via path markers
         if any(token in combined for token in tokens):
             return service, category
     return "unknown", "unknown"
