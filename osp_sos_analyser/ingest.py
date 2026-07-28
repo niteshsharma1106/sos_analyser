@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import tarfile
 import time
 from pathlib import Path
@@ -19,11 +20,21 @@ from .archive_reader import (
     read_text_member,
 )
 from .classification import build_tags, classify_service
-from .db import ensure_schema, insert_commands, insert_logs
+from .db import (
+    archive_already_ingested,
+    dedupe_ingested_rows,
+    ensure_schema,
+    insert_commands,
+    insert_logs,
+    mark_archive_completed,
+    mark_archive_failed,
+    mark_archive_started,
+)
 from .log_parser import parse_log_lines
 from .models import CommandArtifact, IngestionStats, LogEntry
 
 BATCH_SIZE = 1000
+HASH_CHUNK_SIZE = 8 * 1024 * 1024
 
 
 def _default_db_path(reports_dir: Path) -> Path:
@@ -47,6 +58,26 @@ def _command_artifact(
     )
 
 
+def _archive_id(archive_path: Path) -> str:
+    digest = hashlib.sha256()
+    total_size = archive_path.stat().st_size
+    bytes_read = 0
+    last_heartbeat = time.perf_counter()
+    with archive_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(HASH_CHUNK_SIZE), b""):
+            digest.update(chunk)
+            bytes_read += len(chunk)
+            now = time.perf_counter()
+            if total_size >= 256 * 1024 * 1024 and now - last_heartbeat >= 10:
+                print(
+                    f"[progress] {archive_path.name}: duplicate-check hash "
+                    f"{bytes_read / total_size:.0%}",
+                    flush=True,
+                )
+                last_heartbeat = now
+    return digest.hexdigest()
+
+
 def _ingest_archive(
     conn: duckdb.DuckDBPyConnection,
     archive_path: Path,
@@ -57,9 +88,22 @@ def _ingest_archive(
     command_batch: list[CommandArtifact] = []
     log_index = 0
     command_index = 0
+    members_seen = 0
+    last_heartbeat = time.perf_counter()
 
+    print(f"[progress] {report_name}: walking archive stream", flush=True)
     with tarfile.open(archive_path, "r|xz") as archive:
         for member in archive:
+            members_seen += 1
+            now = time.perf_counter()
+            if members_seen == 1 or members_seen % 1000 == 0 or now - last_heartbeat >= 15:
+                print(
+                    f"[progress] {report_name}: scanned {members_seen} archive member(s); "
+                    f"matched {log_index} log file(s), {command_index} command artifact(s)",
+                    flush=True,
+                )
+                last_heartbeat = now
+
             if is_interesting_log_member(member, max_file_size):
                 log_index += 1
                 rows = _ingest_log_member(
@@ -98,7 +142,7 @@ def _ingest_archive(
     )
     print(
         f"[progress] {report_name}: finished archive: {stats.log_files} log file(s), "
-        f"{stats.command_files} command artifact(s)",
+        f"{stats.command_files} command artifact(s), {members_seen} archive member(s) scanned",
         flush=True,
     )
     return stats
@@ -147,6 +191,7 @@ def ingest_sos_reports(
     db_path: str | os.PathLike[str] | None = None,
     clear_existing: bool = False,
     max_file_size_mb: int | None = 25,
+    force_reingest: bool = False,
 ) -> Path:
     """Ingest one or more RHOSP 17.x SOS report tar.xz archives into DuckDB."""
     root = Path(reports_dir or "SOS_REPORTS").resolve()
@@ -172,14 +217,47 @@ def ingest_sos_reports(
         if clear_existing:
             conn.execute("DELETE FROM os_logs")
             conn.execute("DELETE FROM os_commands")
+            conn.execute("DELETE FROM ingested_reports")
 
         for archive_index, archive_path in enumerate(archive_paths, start=1):
+            print(
+                f"[progress] Checking duplicate registry for {archive_path.name}",
+                flush=True,
+            )
+            archive_id = _archive_id(archive_path)
+            if not force_reingest and archive_already_ingested(conn, archive_id):
+                print(
+                    f"[skip] {archive_path.name}: already ingested "
+                    f"(archive_id={archive_id[:12]})",
+                    flush=True,
+                )
+                continue
+
             print(
                 f"[progress] Processing archive {archive_index}/{len(archive_paths)}: "
                 f"{archive_path.name}",
                 flush=True,
             )
-            total = total.add(_ingest_archive(conn, archive_path, max_file_size))
+            mark_archive_started(conn, archive_id, archive_path)
+            try:
+                archive_stats = _ingest_archive(conn, archive_path, max_file_size)
+                removed_logs, removed_commands = dedupe_ingested_rows(conn)
+                if removed_logs or removed_commands:
+                    print(
+                        f"[dedupe] Removed {removed_logs} duplicate log row(s) and "
+                        f"{removed_commands} duplicate command row(s)",
+                        flush=True,
+                    )
+                mark_archive_completed(
+                    conn,
+                    archive_id,
+                    archive_stats.log_rows,
+                    archive_stats.command_rows,
+                )
+                total = total.add(archive_stats)
+            except Exception:
+                mark_archive_failed(conn, archive_id)
+                raise
 
     print(
         "[progress] Ingestion complete: "

@@ -1,4 +1,3 @@
-# osp_sos_analyser/archive_reader.py
 from __future__ import annotations
 
 import codecs
@@ -26,31 +25,6 @@ def normalized_member_name(member: tarfile.TarInfo) -> str:
     return member.name.replace("\\", "/").lstrip("./")
 
 
-def _archive_content_signature(path: Path) -> frozenset[tuple[str, int]]:
-    """Fingerprint an archive by its internal (member path, size) pairs.
-
-    This catches duplicate sosreports that were re-tarred, renamed, or
-    recompressed differently — cases where the outer file bytes/hash differ
-    but the actual log content inside is the same. We strip the report-name
-    root prefix (the first path segment) before comparing, since two exports
-    of the same sosreport often differ only in that top-level folder name
-    (e.g. 'sosreport-host-case123/...' vs 'sosreport_log/sosreport/...').
-    """
-    signature: set[tuple[str, int]] = set()
-    try:
-        with tarfile.open(path, "r|xz") as archive:
-            for member in archive:
-                if not member.isreg():
-                    continue
-                name = normalized_member_name(member)
-                parts = name.split("/", 1)
-                relative_name = parts[1] if len(parts) > 1 else name
-                signature.add((relative_name, member.size))
-    except (tarfile.TarError, OSError) as exc:
-        raise SosReportError(f"Failed to read archive for dedup check: {path}: {exc}") from exc
-    return frozenset(signature)
-
-
 def iter_report_archives(reports_dir: Path) -> Iterator[Path]:
     if not reports_dir.exists():
         return
@@ -62,18 +36,12 @@ def iter_report_archives(reports_dir: Path) -> Iterator[Path]:
         elif path.is_dir():
             candidates.extend(sorted(path.rglob("*.tar.xz")))
 
-    seen_signatures: dict[frozenset[tuple[str, int]], Path] = {}
+    seen_paths: set[Path] = set()
     for path in candidates:
-        signature = _archive_content_signature(path)
-        existing = seen_signatures.get(signature)
-        if existing is not None:
-            print(
-                f"[skip] {path} appears to be a duplicate of {existing} "
-                f"(same internal file listing) — skipping ingestion.",
-                flush=True,
-            )
+        resolved = path.resolve()
+        if resolved in seen_paths:
             continue
-        seen_signatures[signature] = path
+        seen_paths.add(resolved)
         yield path
 
 

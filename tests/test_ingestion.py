@@ -92,3 +92,13 @@ RuntimeError: boom
                 ).fetchone()
                 self.assertIsNotNone(command_value)
                 self.assertIn("CONTAINER ID", command_value[0])
+
+            ingest_sos_reports(reports_dir=reports_dir, db_path=db_path)
+
+            with duckdb.connect(str(db_path)) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0], 4)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM os_commands").fetchone()[0], 1)
+                registry = conn.execute(
+                    "SELECT COUNT(*) FROM ingested_reports WHERE status = 'completed'"
+                ).fetchone()[0]
+                self.assertEqual(registry, 1)

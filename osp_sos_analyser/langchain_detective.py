@@ -56,11 +56,10 @@ def investigate_prompt_with_langchain(
 ) -> InvestigationReport:
     from dotenv import load_dotenv
 
-    load_dotenv()
-
+    if os.getenv("OSP_SOS_SKIP_DOTENV") != "1":
+        load_dotenv()
 
     model_provider = os.getenv("OSP_SOS_MODEL_PROVIDER", "openai")
-    os.environ["GROQ_API_KEY"]= os.getenv("GROK_API_KEY")
     required_key = _required_api_key(model_provider)
     if required_key and not os.getenv(required_key):
         raise MissingLLMConfiguration(
@@ -77,13 +76,10 @@ def investigate_prompt_with_langchain(
     from langchain.agents import create_agent
     from langchain.chat_models import init_chat_model
 
-    # llm = init_chat_model(
-    #     model=model or os.getenv("OSP_SOS_MODEL", _default_model(model_provider)),
-    #     model_provider=model_provider,
-    # )
     llm = init_chat_model(
-        model="llama-3.1-8b-instant",
-        model_provider="groq")
+        model=model or os.getenv("OSP_SOS_MODEL", _default_model(model_provider)),
+        model_provider=model_provider,
+    )
     
     agent = create_agent(
         model=llm,
