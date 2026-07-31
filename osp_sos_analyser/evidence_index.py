@@ -255,12 +255,29 @@ def get_evidence(
     *,
     limit: int = 50,
     services: Sequence[str] = (),
+    hostnames: Sequence[str] = (),
+    node_roles: Sequence[str] = (),
 ) -> list[EvidenceMention]:
     clauses = ["lower(entity_id) = lower(?)"]
     params: list[object] = [entity_id]
     if services:
         clauses.append(f"service IN ({', '.join('?' for _ in services)})")
         params.extend(services)
+    if hostnames:
+        clauses.append(
+            f"lower(hostname) IN ({', '.join('?' for _ in hostnames)})"
+        )
+        params.extend(h.lower() for h in hostnames)
+    if node_roles:
+        clauses.append(
+            f"""
+            lower(hostname) IN (
+                SELECT lower(hostname) FROM cluster_nodes
+                WHERE lower(node_role) IN ({', '.join('?' for _ in node_roles)})
+            )
+            """
+        )
+        params.extend(role.lower() for role in node_roles)
     params.append(limit)
     rows = conn.execute(
         f"""
@@ -285,6 +302,182 @@ def get_evidence(
             report_name=str(row[7] or ""),
             message_excerpt=str(row[8] or ""),
         )
+        for row in rows
+    ]
+
+
+def get_host_activity(
+    conn: Any,
+    hostname: str,
+    *,
+    services: Sequence[str] = (),
+    levels: Sequence[str] = (),
+    limit: int = 40,
+) -> list[EvidenceMention]:
+    """Return recent log digests for one host (multi-node RCA helper)."""
+    clauses = ["lower(COALESCE(hostname, '')) = lower(?)"]
+    params: list[object] = [hostname]
+    if services:
+        clauses.append(f"service IN ({', '.join('?' for _ in services)})")
+        params.extend(services)
+    if levels:
+        clauses.append(f"upper(level) IN ({', '.join('?' for _ in levels)})")
+        params.extend(level.upper() for level in levels)
+    params.append(limit)
+    rows = conn.execute(
+        f"""
+        SELECT timestamp, COALESCE(hostname, ''), service, level, message,
+               source_file, report_name
+        FROM os_logs
+        WHERE {' AND '.join(clauses)}
+        ORDER BY
+          CASE upper(level)
+            WHEN 'CRITICAL' THEN 0 WHEN 'ERROR' THEN 1
+            WHEN 'WARNING' THEN 2 ELSE 3
+          END,
+          timestamp NULLS LAST
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [
+        EvidenceMention(
+            entity_id=hostname,
+            entity_type="host",
+            timestamp=row[0],
+            hostname=str(row[1] or hostname),
+            service=str(row[2] or ""),
+            level=str(row[3] or ""),
+            source_file=str(row[5] or ""),
+            report_name=str(row[6] or ""),
+            message_excerpt=truncate_text(str(row[4] or ""), DIGEST_MESSAGE_CHARS),
+        )
+        for row in rows
+    ]
+
+
+def compare_node_activity(
+    conn: Any,
+    *,
+    services: Sequence[str] = (),
+    levels: Sequence[str] = ("CRITICAL", "ERROR", "WARNING"),
+    cluster_id: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Aggregate log severity counts by hostname/role for cross-node comparison."""
+    clauses: list[str] = ["COALESCE(l.hostname, '') <> ''"]
+    params: list[object] = []
+    if services:
+        clauses.append(f"l.service IN ({', '.join('?' for _ in services)})")
+        params.extend(services)
+    if levels:
+        clauses.append(f"upper(l.level) IN ({', '.join('?' for _ in levels)})")
+        params.extend(level.upper() for level in levels)
+    if cluster_id:
+        clauses.append("l.cluster_id = ?")
+        params.append(cluster_id)
+    params.append(limit)
+    rows = conn.execute(
+        f"""
+        SELECT
+            COALESCE(l.hostname, '') AS hostname,
+            COALESCE(n.node_role, l.node_role, '') AS node_role,
+            COALESCE(l.service, '') AS service,
+            upper(COALESCE(l.level, '')) AS level,
+            COUNT(*) AS event_count,
+            MIN(l.timestamp) AS first_seen,
+            MAX(l.timestamp) AS last_seen
+        FROM os_logs l
+        LEFT JOIN cluster_nodes n
+          ON lower(n.hostname) = lower(l.hostname)
+        WHERE {' AND '.join(clauses)}
+        GROUP BY 1, 2, 3, 4
+        ORDER BY event_count DESC, hostname, service, level
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [
+        {
+            "hostname": str(row[0] or ""),
+            "node_role": str(row[1] or ""),
+            "service": str(row[2] or ""),
+            "level": str(row[3] or ""),
+            "event_count": int(row[4] or 0),
+            "first_seen": row[5],
+            "last_seen": row[6],
+        }
+        for row in rows
+    ]
+
+
+def search_logs_by_node(
+    conn: Any,
+    *,
+    hostnames: Sequence[str] = (),
+    node_roles: Sequence[str] = (),
+    services: Sequence[str] = (),
+    search_terms: Sequence[str] = (),
+    resource_id: str = "",
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Raw log search with optional host/role scope for multi-node investigations."""
+    clauses: list[str] = []
+    params: list[object] = []
+    if hostnames:
+        clauses.append(
+            f"lower(COALESCE(hostname, '')) IN ({', '.join('?' for _ in hostnames)})"
+        )
+        params.extend(h.lower() for h in hostnames)
+    if node_roles:
+        clauses.append(
+            f"""
+            lower(COALESCE(hostname, '')) IN (
+                SELECT lower(hostname) FROM cluster_nodes
+                WHERE lower(node_role) IN ({', '.join('?' for _ in node_roles)})
+            )
+            """
+        )
+        params.extend(role.lower() for role in node_roles)
+    if services:
+        clauses.append(f"service IN ({', '.join('?' for _ in services)})")
+        params.extend(services)
+    if resource_id:
+        clauses.append("message ILIKE ?")
+        params.append(f"%{resource_id}%")
+    for term in search_terms:
+        if term.strip():
+            clauses.append("message ILIKE ?")
+            params.append(f"%{term.strip()}%")
+    where = " AND ".join(clauses) if clauses else "1=1"
+    params.append(limit)
+    rows = conn.execute(
+        f"""
+        SELECT timestamp, COALESCE(hostname, ''), COALESCE(node_role, ''),
+               service, level, message, source_file, report_name
+        FROM os_logs
+        WHERE {where}
+        ORDER BY
+          CASE upper(level)
+            WHEN 'CRITICAL' THEN 0 WHEN 'ERROR' THEN 1
+            WHEN 'WARNING' THEN 2 ELSE 3
+          END,
+          timestamp NULLS LAST
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [
+        {
+            "timestamp": row[0],
+            "hostname": str(row[1] or ""),
+            "node_role": str(row[2] or ""),
+            "service": str(row[3] or ""),
+            "level": str(row[4] or ""),
+            "message": str(row[5] or ""),
+            "source_file": str(row[6] or ""),
+            "report_name": str(row[7] or ""),
+        }
         for row in rows
     ]
 

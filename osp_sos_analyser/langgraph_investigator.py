@@ -32,11 +32,14 @@ You are an OpenStack RCA investigator.
 
 Investigation order (mandatory):
 1) Call get_cluster_overview once to understand nodes/roles.
-2) If you have a UUID/req-id/hostname, call get_entity_evidence first.
-3) Extract related IDs from digests and query those with get_entity_evidence
+2) If multiple nodes are present, call compare_nodes to see which hosts are noisy.
+3) If you have a UUID/req-id/hostname, call get_entity_evidence first.
+   Use hostname= or node_role= filters when the incident is node-specific.
+4) Extract related IDs from digests and query those with get_entity_evidence
    (ports/networks -> neutron/ovn, volumes/images -> cinder/glance, instances -> nova).
-4) Use list_indexed_entities if you need candidates by type.
-5) Use search_os_logs only as a fallback when the evidence index has no hits.
+5) Use list_indexed_entities if you need candidates by type.
+6) Use search_os_logs only as a fallback when the evidence index has no hits.
+   Prefer scoping with hostname= or node_role= (controller vs compute).
 
 Tool results are already digests. Do not paste them back in full.
 Stop once you can explain or rule out a root cause. End with a concise RCA.
@@ -56,6 +59,14 @@ class InvestigationEntities(BaseModel):
     service: Optional[str] = Field(default=None)
     problem: Optional[str] = Field(default=None)
     cluster: Optional[str] = Field(default=None)
+    hostname: Optional[str] = Field(
+        default=None,
+        description="Hostname if the incident is tied to one SOS node",
+    )
+    node_role: Optional[str] = Field(
+        default=None,
+        description="controller, compute, or other role when known",
+    )
 
 
 class TimeWindow(BaseModel):

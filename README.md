@@ -88,7 +88,24 @@ For local testing without an LLM, use the deterministic fallback:
 python main.py analyze "VM fd27c003-5b78-4abb-a85a-aa90973f7ff0 failed to create" --db-path sos_analysis.duckdb --offline
 ```
 
+## Multi-node cluster ingest
+
+Place controller and compute SOS archives in the same folder and ingest once into one DuckDB:
+
+```bash
+# SOS_REPORTS/ may contain multiple .tar.xz archives
+$env:OSP_SOS_SKIP_JOURNALS="1"   # Windows tip
+uv run python main.py ingest --reports-dir SOS_REPORTS --db-path sos_analysis.duckdb --clear-existing
+```
+
+All nodes share one `cluster_id`. The chat/investigator can then:
+
+- `get_cluster_overview` — list hosts/roles
+- `compare_nodes` — ERROR/WARNING counts per host
+- `get_entity_evidence` / `search_os_logs` with `hostname=` or `node_role=` filters
+
 ## Chat UI (ask / answer)
+
 
 After ingestion, launch an interactive chat UI instead of the CLI:
 

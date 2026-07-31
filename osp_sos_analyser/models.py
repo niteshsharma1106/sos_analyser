@@ -65,6 +65,8 @@ class LogRecord:
     message: str
     source_file: str
     report_name: str
+    hostname: str = ""
+    node_role: str = ""
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,8 @@ class CommandRecord:
     source_file: str
     output: str
     report_name: str
+    hostname: str = ""
+    node_role: str = ""
 
 
 @dataclass(frozen=True)

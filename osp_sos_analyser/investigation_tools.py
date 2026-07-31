@@ -7,11 +7,14 @@ from typing import Any
 from .context_pack import truncate_text
 from .evidence_index import (
     EvidenceMention,
+    compare_node_activity,
     extract_entity_ids,
     get_cluster_manifest,
     get_entity,
     get_evidence,
+    get_host_activity,
     list_entities,
+    search_logs_by_node,
 )
 from .models import LogRecord
 
@@ -54,6 +57,48 @@ def format_evidence_mentions(mentions: Sequence[EvidenceMention]) -> str:
     return "\n".join(lines)
 
 
+def format_node_comparison(rows: Sequence[dict[str, Any]]) -> str:
+    if not rows:
+        return "No per-node activity matched the filters."
+    lines = ["hostname|role|service|level|count|first_seen|last_seen"]
+    for row in rows:
+        lines.append(
+            "|".join(
+                [
+                    str(row.get("hostname") or "-"),
+                    str(row.get("node_role") or "-"),
+                    str(row.get("service") or "-"),
+                    str(row.get("level") or "-"),
+                    str(row.get("event_count") or 0),
+                    str(row.get("first_seen") or ""),
+                    str(row.get("last_seen") or ""),
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
+def format_node_log_rows(rows: Sequence[dict[str, Any]]) -> str:
+    if not rows:
+        return "No matching logs."
+    lines = []
+    for row in rows:
+        lines.append(
+            "|".join(
+                [
+                    str(row.get("timestamp") or ""),
+                    str(row.get("hostname") or "-"),
+                    str(row.get("node_role") or "-"),
+                    str(row.get("service") or "-"),
+                    str(row.get("level") or "-"),
+                    truncate_text(str(row.get("message") or ""), 180),
+                    str(row.get("source_file") or ""),
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
 def mentions_to_log_records(mentions: Sequence[EvidenceMention]) -> tuple[LogRecord, ...]:
     return tuple(
         LogRecord(
@@ -64,6 +109,7 @@ def mentions_to_log_records(mentions: Sequence[EvidenceMention]) -> tuple[LogRec
             message=item.message_excerpt,
             source_file=item.source_file,
             report_name=item.report_name,
+            hostname=item.hostname or "",
         )
         for item in mentions
     )
@@ -78,12 +124,19 @@ def indexed_evidence_for_hints(
 ) -> list[LogRecord]:
     """Prefer Evidence Index hits for identifiers; otherwise return empty."""
     identifiers = getattr(hints, "identifiers", ()) or ()
+    hostnames = tuple(getattr(hints, "hostnames", ()) or ())
     if not identifiers:
         return []
     mentions: list[EvidenceMention] = []
     for identifier in list(identifiers)[:3]:
         mentions.extend(
-            get_evidence(conn, identifier, services=services, limit=limit)
+            get_evidence(
+                conn,
+                identifier,
+                services=services,
+                hostnames=hostnames,
+                limit=limit,
+            )
         )
     return list(mentions_to_log_records(mentions)[:limit])
 
@@ -98,6 +151,11 @@ def prefetch_investigation_digest(
 ) -> str:
     """Build a compact digest from manifest + evidence index for the investigator."""
     sections = ["## Cluster manifest", format_manifest(conn)]
+
+    nodes = get_cluster_manifest(conn)
+    if len(nodes) > 1:
+        comparison = compare_node_activity(conn, limit=40)
+        sections.append("## Cross-node activity\n" + format_node_comparison(comparison))
 
     ids = []
     if resource_id:
@@ -140,18 +198,49 @@ def build_langchain_tools(conn: Any):
         return format_manifest(conn)
 
     @tool
+    def compare_nodes(
+        service: str = "",
+        level: str = "",
+        limit: int = 40,
+    ) -> str:
+        """
+        Compare WARNING/ERROR/CRITICAL log counts across hosts in the ingested cluster.
+        Use this for multi-node incidents (controller vs compute) to see which node is noisy.
+        Optional service filter (nova, neutron, ...). Optional level filter (ERROR, WARNING, ...).
+        """
+        services = [service.strip()] if service.strip() else ()
+        levels = (
+            [part.strip().upper() for part in level.split(",") if part.strip()]
+            if level.strip()
+            else ("CRITICAL", "ERROR", "WARNING")
+        )
+        capped = max(1, min(int(limit), 100))
+        rows = compare_node_activity(
+            conn,
+            services=services,
+            levels=levels,
+            limit=capped,
+        )
+        return format_node_comparison(rows)
+
+    @tool
     def get_entity_evidence(
         entity_id: str,
         service: str = "",
+        hostname: str = "",
+        node_role: str = "",
         limit: int = 15,
     ) -> str:
         """
-        Fetch indexed evidence for one canonical entity (instance/port/volume/network/req-/host UUID).
-        Prefer this over searching raw logs. Optional service filter (nova, neutron, cinder, ...).
+        Fetch indexed evidence for one canonical entity (instance/port/volume/network/req-/host).
+        Prefer this over searching raw logs. Optional service/hostname/node_role filters.
+        For hostnames, also returns recent host activity from os_logs.
         """
         if not entity_id.strip():
             return "entity_id is required."
         services = [service] if service.strip() else ()
+        hostnames = [hostname] if hostname.strip() else ()
+        node_roles = [node_role] if node_role.strip() else ()
         capped = max(1, min(int(limit), 30))
         entity = get_entity(conn, entity_id.strip())
         header = (
@@ -164,8 +253,23 @@ def build_langchain_tools(conn: Any):
             entity_id.strip(),
             limit=capped,
             services=services,
+            hostnames=hostnames,
+            node_roles=node_roles,
         )
-        return header + format_evidence_mentions(mentions)
+        body = format_evidence_mentions(mentions)
+        if entity and entity.entity_type == "host":
+            host_rows = get_host_activity(
+                conn,
+                entity.entity_id,
+                services=services,
+                limit=capped,
+            )
+            body = (
+                body
+                + "\n\nHost activity:\n"
+                + format_evidence_mentions(host_rows)
+            )
+        return header + body
 
     @tool
     def list_indexed_entities(entity_type: str = "", limit: int = 20) -> str:
@@ -190,21 +294,28 @@ def build_langchain_tools(conn: Any):
         service: str = "",
         resource_id: str = "",
         search_terms: str = "",
+        hostname: str = "",
+        node_role: str = "",
         limit: int = 15,
     ) -> str:
         """
-        Fallback raw log search. Prefer get_entity_evidence when you have a UUID/req-id.
+        Fallback raw log search with optional hostname/node_role scope.
+        Prefer get_entity_evidence when you have a UUID/req-id.
         If resource_id is set, this first returns indexed evidence for that entity.
         """
         capped = max(1, min(int(limit), 30))
+        hostnames = [hostname.strip()] if hostname.strip() else ()
+        node_roles = [node_role.strip()] if node_role.strip() else ()
+        services = [service] if service.strip() else ()
         if resource_id.strip():
-            services = [service] if service.strip() else ()
             entity = get_entity(conn, resource_id.strip())
             mentions = get_evidence(
                 conn,
                 resource_id.strip(),
                 limit=capped,
                 services=services,
+                hostnames=hostnames,
+                node_roles=node_roles,
             )
             if mentions:
                 header = (
@@ -219,48 +330,21 @@ def build_langchain_tools(conn: Any):
                     + "\n\n(Use get_entity_evidence for related IDs extracted from these digests.)"
                 )
 
-        clauses: list[str] = []
-        params: list[object] = []
-        if service:
-            clauses.append("service = ?")
-            params.append(service)
-        if resource_id:
-            clauses.append("message ILIKE ?")
-            params.append(f"%{resource_id}%")
-        for term in search_terms.split():
-            clauses.append("message ILIKE ?")
-            params.append(f"%{term}%")
-        where = " AND ".join(clauses) if clauses else "1=1"
-        params.append(capped)
-        rows = conn.execute(
-            f"""
-            SELECT timestamp, COALESCE(hostname, ''), service, level, message, source_file
-            FROM os_logs
-            WHERE {where}
-            ORDER BY
-              CASE level WHEN 'CRITICAL' THEN 0 WHEN 'ERROR' THEN 1
-                   WHEN 'WARNING' THEN 2 ELSE 3 END,
-              timestamp NULLS LAST
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
-        if not rows:
-            return "No matching logs."
-        lines = []
-        for ts, host, svc, level, message, source in rows:
-            lines.append(
-                "|".join(
-                    [
-                        str(ts or ""),
-                        str(host or "-"),
-                        str(svc or "-"),
-                        str(level or "-"),
-                        truncate_text(str(message or ""), 180),
-                        str(source or ""),
-                    ]
-                )
-            )
-        return "\n".join(lines)
+        rows = search_logs_by_node(
+            conn,
+            hostnames=hostnames,
+            node_roles=node_roles,
+            services=services,
+            search_terms=search_terms.split(),
+            resource_id=resource_id.strip(),
+            limit=capped,
+        )
+        return format_node_log_rows(rows)
 
-    return [get_cluster_overview, get_entity_evidence, list_indexed_entities, search_os_logs]
+    return [
+        get_cluster_overview,
+        compare_nodes,
+        get_entity_evidence,
+        list_indexed_entities,
+        search_os_logs,
+    ]
