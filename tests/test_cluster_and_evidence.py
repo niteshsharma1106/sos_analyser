@@ -9,8 +9,12 @@ from pathlib import Path
 import duckdb
 
 from osp_sos_analyser.cluster_loader import (
+    apply_manifest_text,
+    finalize_node_identity,
     guess_hostname_from_archive_name,
     infer_node_role,
+    is_valid_hostname,
+    NodeManifest,
 )
 from osp_sos_analyser.evidence_index import get_cluster_manifest, get_evidence, get_entity
 from osp_sos_analyser.ingest import ingest_sos_reports
@@ -22,8 +26,49 @@ class ClusterManifestAndEvidenceIndexTests(unittest.TestCase):
             guess_hostname_from_archive_name("sosreport-compute-03-2026-07-09.tar.xz"),
             "compute-03",
         )
+        self.assertEqual(
+            guess_hostname_from_archive_name(
+                "sosreport-n1-wrkld1-b1-b13-ctrl001-2026-07-27-cluluaj.tar.xz"
+            ),
+            "n1-wrkld1-b1-b13-ctrl001",
+        )
         self.assertEqual(infer_node_role("compute-03"), "compute")
         self.assertEqual(infer_node_role("controller-0"), "controller")
+        self.assertEqual(
+            infer_node_role("n1-wrkld1-b1-b13-ctrl001", "sosreport-n1-wrkld1-b1-b13-ctrl001.tar.xz"),
+            "controller",
+        )
+
+    def test_uname_output_does_not_overwrite_hostname_with_linux(self) -> None:
+        archive = "sosreport-n1-wrkld1-b1-b13-ctrl001-2026-07-27-cluluaj.tar.xz"
+        manifest = NodeManifest(
+            archive_name=archive,
+            hostname="n1-wrkld1-b1-b13-ctrl001",
+            node_role="controller",
+        )
+        apply_manifest_text(
+            manifest,
+            "sos_commands/kernel/uname_-a",
+            "Linux n1-wrkld1-b1-b13-ctrl001.example.com 5.14.0-427.el9.x86_64 #1 SMP",
+        )
+        self.assertEqual(manifest.hostname, "n1-wrkld1-b1-b13-ctrl001")
+
+        apply_manifest_text(manifest, "hostname", "Linux\n")
+        self.assertEqual(manifest.hostname, "n1-wrkld1-b1-b13-ctrl001")
+        self.assertFalse(is_valid_hostname("Linux"))
+
+        bad = NodeManifest(archive_name=archive, hostname="Linux", node_role="unknown")
+        finalize_node_identity(bad)
+        self.assertEqual(bad.hostname, "n1-wrkld1-b1-b13-ctrl001")
+        self.assertEqual(bad.node_role, "controller")
+
+        only_uname = NodeManifest(archive_name=archive, hostname="", node_role="unknown")
+        apply_manifest_text(
+            only_uname,
+            "uname_-a",
+            "Linux n1-wrkld1-b1-b13-ctrl001.example.com 5.14.0-427.el9.x86_64",
+        )
+        self.assertEqual(only_uname.hostname, "n1-wrkld1-b1-b13-ctrl001")
 
     def test_ingest_builds_manifest_and_evidence_index(self) -> None:
         port_id = "55ab45cf-6925-4811-a008-6fe60d491c5b"

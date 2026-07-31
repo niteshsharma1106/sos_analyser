@@ -9,7 +9,8 @@ from pathlib import Path
 
 from .archive_reader import normalized_member_name, read_text_member
 
-HOSTNAME_FILE_RE = re.compile(r"(?:^|/)(?:hostname|uname(?:_-a)?)$", re.I)
+HOSTNAME_BASENAME_RE = re.compile(r"(?:^|/)hostname$", re.I)
+UNAME_BASENAME_RE = re.compile(r"(?:^|/)uname(?:_-a)?$", re.I)
 INSTALLED_RPMS_RE = re.compile(r"(?:^|/)installed-rpms(?:\.txt)?$", re.I)
 SOSREPORT_HOST_RE = re.compile(
     r"sosreport[-_](?P<host>[A-Za-z0-9][A-Za-z0-9._-]{1,63?}?)(?:[-_](?:20\d{2}|case|id)|\.tar)",
@@ -20,6 +21,20 @@ ROLE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("compute", ("compute", "novacompute")),
     ("storage", ("storage", "ceph", "cinder")),
     ("networker", ("networker", "network")),
+)
+# First token of `uname -a` / junk hostname files must never become the node id.
+INVALID_HOSTNAMES = frozenset(
+    {
+        "linux",
+        "darwin",
+        "windows",
+        "localhost",
+        "localhost.localdomain",
+        "unknown",
+        "none",
+        "null",
+        "(none)",
+    }
 )
 OPENSTACK_RPM_RE = re.compile(
     r"^(?P<name>openstack-(?:nova|neutron|cinder|glance|keystone|heat)[^\s]*)\s+(?P<ver>\S+)",
@@ -78,10 +93,43 @@ def is_cluster_manifest_member(member: tarfile.TarInfo, max_file_size: int) -> b
     if not member.isreg() or member.size <= 0 or member.size > max_file_size:
         return False
     name = normalized_member_name(member)
-    if HOSTNAME_FILE_RE.search(name) or INSTALLED_RPMS_RE.search(name):
+    if (
+        HOSTNAME_BASENAME_RE.search(name)
+        or UNAME_BASENAME_RE.search(name)
+        or INSTALLED_RPMS_RE.search(name)
+    ):
         return True
     lower = name.lower()
     return lower.endswith("/hostname") or "/sos_commands/host/" in f"/{lower}"
+
+
+def is_valid_hostname(hostname: str) -> bool:
+    candidate = (hostname or "").strip().strip(".")
+    if not candidate or len(candidate) > 253:
+        return False
+    if candidate.lower() in INVALID_HOSTNAMES:
+        return False
+    # Reject pure OS/kernel tokens and paths.
+    if "/" in candidate or " " in candidate:
+        return False
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", candidate):
+        return False
+    return True
+
+
+def finalize_node_identity(manifest: NodeManifest) -> None:
+    """Ensure hostname/role are usable after scanning an archive."""
+    if not is_valid_hostname(manifest.hostname):
+        manifest.hostname = guess_hostname_from_archive_name(manifest.archive_name)
+    if not is_valid_hostname(manifest.hostname):
+        manifest.hostname = _fallback_hostname(manifest.archive_name)
+    # Re-infer role from the final hostname + archive name so ctrl/compute
+    # tokens in the archive name still win after a bad hostname file.
+    inferred = infer_node_role(manifest.hostname, manifest.archive_name)
+    if inferred != "unknown":
+        manifest.node_role = inferred
+    elif not manifest.node_role:
+        manifest.node_role = "unknown"
 
 
 def apply_manifest_text(manifest: NodeManifest, source_file: str, text: str) -> None:
@@ -90,16 +138,22 @@ def apply_manifest_text(manifest: NodeManifest, source_file: str, text: str) -> 
     if not body:
         return
 
-    if HOSTNAME_FILE_RE.search(name) or name.endswith("/hostname"):
+    basename = Path(name).name
+    if HOSTNAME_BASENAME_RE.search(name) or name.endswith("/hostname"):
+        # Prefer a real /hostname file over archive-name guess, but never accept
+        # `Linux` (common when uname output is mistakenly read as hostname).
         host = _parse_hostname_payload(body)
-        if host:
+        if is_valid_hostname(host):
             manifest.hostname = host
             manifest.node_role = infer_node_role(host, manifest.archive_name)
         return
 
-    if "uname" in Path(name).name:
+    if UNAME_BASENAME_RE.search(name) or basename.startswith("uname"):
         host = _parse_uname_hostname(body)
-        if host and not manifest.hostname:
+        # Only fill hostname from uname when we do not already have a better value.
+        if is_valid_hostname(host) and (
+            not manifest.hostname or not is_valid_hostname(manifest.hostname)
+        ):
             manifest.hostname = host
             manifest.node_role = infer_node_role(host, manifest.archive_name)
         return
@@ -187,7 +241,7 @@ def _fallback_hostname(archive_name: str) -> str:
 def _parse_hostname_payload(text: str) -> str:
     for line in text.splitlines():
         candidate = line.strip().split()[0] if line.strip() else ""
-        if candidate and not candidate.startswith("#"):
+        if candidate and not candidate.startswith("#") and is_valid_hostname(candidate):
             return candidate
     return ""
 
@@ -196,7 +250,13 @@ def _parse_uname_hostname(text: str) -> str:
     # uname -a: Linux hostname.example.com 5.14.0-...
     parts = text.strip().split()
     if len(parts) >= 2 and parts[0].lower() == "linux":
-        return parts[1].split(".")[0]
+        host = parts[1]
+        # Keep short hostname for cluster matching unless only FQDN is useful.
+        short = host.split(".")[0]
+        if is_valid_hostname(short):
+            return short
+        if is_valid_hostname(host):
+            return host
     return ""
 
 

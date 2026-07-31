@@ -30,6 +30,7 @@ from .classification import build_tags, classify_service
 from .cluster_loader import (
     NodeManifest,
     absorb_manifest_member,
+    finalize_node_identity,
     is_cluster_manifest_member,
     new_node_manifest,
     note_service_from_path,
@@ -235,6 +236,7 @@ def _ingest_archive(
             command_rows=command_rows,
         )
     )
+    finalize_node_identity(manifest)
     stamp_report_identity(
         conn,
         report_name=report_name,
