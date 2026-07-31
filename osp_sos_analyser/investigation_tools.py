@@ -19,6 +19,7 @@ from .evidence_index import (
     search_commands_by_node,
     search_logs_by_node,
 )
+from .models import LogRecord
 from .relationship_graph import (
     format_operation_path,
     format_relationships,
@@ -146,6 +147,48 @@ def format_command_rows(rows: Sequence[dict[str, Any]]) -> str:
         output = truncate_text(str(row.get("output") or ""), 1200)
         blocks.append(header + "\n" + output)
     return "\n\n".join(blocks)
+
+
+def mentions_to_log_records(mentions: Sequence[EvidenceMention]) -> tuple[LogRecord, ...]:
+    return tuple(
+        LogRecord(
+            timestamp=item.timestamp,
+            level=item.level,
+            service=item.service or "unknown",
+            module=item.entity_type or "",
+            message=item.message_excerpt,
+            source_file=item.source_file,
+            report_name=item.report_name,
+            hostname=item.hostname or "",
+        )
+        for item in mentions
+    )
+
+
+def indexed_evidence_for_hints(
+    conn: Any,
+    hints: Any,
+    *,
+    services: Sequence[str] = (),
+    limit: int = 10,
+) -> list[LogRecord]:
+    """Prefer Evidence Index hits for identifiers; otherwise return empty."""
+    identifiers = getattr(hints, "identifiers", ()) or ()
+    hostnames = tuple(getattr(hints, "hostnames", ()) or ())
+    if not identifiers:
+        return []
+    mentions: list[EvidenceMention] = []
+    for identifier in list(identifiers)[:3]:
+        mentions.extend(
+            get_evidence(
+                conn,
+                identifier,
+                services=services,
+                hostnames=hostnames,
+                limit=limit,
+            )
+        )
+    return list(mentions_to_log_records(mentions)[:limit])
 
 
 def resolve_hostnames(conn: Any, hint: str) -> list[str]:
