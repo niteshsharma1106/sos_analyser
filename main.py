@@ -13,6 +13,7 @@ from osp_sos_analyser.langgraph_investigator import (
     investigate_with_langgraph,
     render_investigation_result,
 )
+from osp_sos_analyser.chat_ui import launch_chat
 from pydantic import BaseModel, Field
 
 
@@ -101,6 +102,33 @@ def build_analyze_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_chat_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Launch interactive SOS investigation chat UI")
+    parser.add_argument(
+        "--db-path",
+        default="sos_analysis.duckdb",
+        help="DuckDB database created by the ingestion phase",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Default the UI to offline deterministic mode",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Optional model override (defaults to OSP_SOS_MODEL)",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="UI bind address")
+    parser.add_argument("--port", type=int, default=7860, help="UI bind port")
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        help="Create a temporary public Gradio share link",
+    )
+    return parser
+
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "analyze":
         args = build_analyze_parser().parse_args(sys.argv[2:])
@@ -118,6 +146,18 @@ def main() -> None:
             except MissingLLMConfiguration as exc:
                 raise SystemExit(str(exc)) from exc
             print(render_investigation_result(result))
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "chat":
+        args = build_chat_parser().parse_args(sys.argv[2:])
+        launch_chat(
+            db_path=args.db_path,
+            offline=args.offline,
+            model=args.model,
+            host=args.host,
+            port=args.port,
+            share=args.share,
+        )
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "ingest":

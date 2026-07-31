@@ -77,6 +77,18 @@ For local testing without an LLM, use the deterministic fallback:
 python main.py analyze "VM fd27c003-5b78-4abb-a85a-aa90973f7ff0 failed to create" --db-path sos_analysis.duckdb --offline
 ```
 
+## Chat UI (ask / answer)
+
+After ingestion, launch an interactive chat UI instead of the CLI:
+
+```bash
+uv run python main.py chat --db-path sos_analysis.duckdb
+# or
+uv run osp-sos-chat --db-path sos_analysis.duckdb
+```
+
+Open the printed local URL (default `http://127.0.0.1:7860`). Use **Offline mode** in Investigation settings for deterministic answers without an LLM.
+
 ## Current capabilities
 
 - Reads multiple .tar.xz SOS archives directly
