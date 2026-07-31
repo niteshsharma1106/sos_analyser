@@ -55,7 +55,9 @@ To run the Phase 2 detective workflow after ingestion:
 python main.py analyze "VMs on compute-03 suddenly lost network connectivity at 14:00" --db-path sos_analysis.duckdb
 ```
 
-Phase 2 uses a LangChain tool-calling agent by default. Create a local `.env` file first:
+Phase 2 uses a LangChain tool-calling agent by default. Create a local `.env` file first.
+
+**Google Gemini**
 
 ```env
 GOOGLE_API_KEY=your-gemini-api-key-here
@@ -63,14 +65,23 @@ OSP_SOS_MODEL=gemini-2.5-pro
 OSP_SOS_MODEL_PROVIDER=google_genai
 ```
 
-For OpenAI instead, use `OPENAI_API_KEY` and `OSP_SOS_MODEL_PROVIDER=openai`.
+**Groq** (for models like `openai/gpt-oss-120b`)
 
-The model is initialized in code with:
-
-```python
-from langchain.chat_models import init_chat_model
+```env
+GROQ_API_KEY=your-groq-api-key-here
+OSP_SOS_MODEL=openai/gpt-oss-120b
+OSP_SOS_MODEL_PROVIDER=groq
 ```
 
+**OpenAI**
+
+```env
+OPENAI_API_KEY=your-openai-api-key-here
+OSP_SOS_MODEL=gpt-4o-mini
+OSP_SOS_MODEL_PROVIDER=openai
+```
+
+Provider and model must match. Putting a Groq model id under `google_genai` causes a 404.
 For local testing without an LLM, use the deterministic fallback:
 
 ```bash

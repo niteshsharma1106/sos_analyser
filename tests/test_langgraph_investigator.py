@@ -70,6 +70,32 @@ class LangGraphInvestigatorModuleTests(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+    def test_init_llm_rejects_groq_model_on_google_provider(self) -> None:
+        previous = {
+            key: os.environ.pop(key, None)
+            for key in (
+                "GROQ_API_KEY",
+                "GROK_API_KEY",
+                "OPENAI_API_KEY",
+                "GOOGLE_API_KEY",
+                "OSP_SOS_MODEL",
+                "OSP_SOS_MODEL_PROVIDER",
+            )
+        }
+        os.environ["OSP_SOS_SKIP_DOTENV"] = "1"
+        os.environ["GOOGLE_API_KEY"] = "test-key"
+        try:
+            with self.assertRaises(MissingLLMConfiguration) as ctx:
+                _init_llm(model="openai/gpt-oss-120b", model_provider="google_genai")
+            self.assertIn("not a Google Gemini model", str(ctx.exception))
+        finally:
+            os.environ.pop("OSP_SOS_SKIP_DOTENV", None)
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_schema_ready_for_investigator_db(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "empty.duckdb"

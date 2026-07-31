@@ -95,15 +95,71 @@ class InvestigationState(TypedDict, total=False):
     next_node: str
 
 
+def _normalize_provider(model_provider: str) -> str:
+    provider = (model_provider or "").strip().lower().replace("-", "_")
+    if provider in {"google", "gemini"}:
+        return "google_genai"
+    if provider in {"grok"}:
+        return "groq"
+    return provider
+
+
 def _required_api_key(model_provider: str) -> str | None:
-    provider = (model_provider or "").lower()
+    provider = _normalize_provider(model_provider)
     if provider in {"openai"}:
         return "OPENAI_API_KEY"
-    if provider in {"google_genai", "google", "gemini"}:
+    if provider in {"google_genai", "google_vertexai"}:
         return "GOOGLE_API_KEY"
     if provider in {"groq"}:
         return "GROQ_API_KEY"
     return None
+
+
+def _default_model(model_provider: str) -> str:
+    provider = _normalize_provider(model_provider)
+    if provider == "google_genai":
+        return "gemini-2.5-pro"
+    if provider == "openai":
+        return "gpt-4o-mini"
+    # Groq-hosted open models use the org/model form.
+    return "openai/gpt-oss-120b"
+
+
+def _validate_model_provider(model: str, model_provider: str) -> None:
+    """Fail fast on obvious model/provider mismatches before the HTTP call."""
+    provider = _normalize_provider(model_provider)
+    lower = (model or "").strip().lower()
+    if not lower:
+        return
+
+    looks_like_groq = lower.startswith("openai/") or lower.startswith("meta-llama/")
+    looks_like_gemini = lower.startswith("gemini")
+    looks_like_openai_api = lower.startswith("gpt-") or lower.startswith("o1") or lower.startswith("o3")
+
+    if provider == "google_genai" and (looks_like_groq or looks_like_openai_api):
+        raise MissingLLMConfiguration(
+            f"Model '{model}' is not a Google Gemini model, but "
+            f"OSP_SOS_MODEL_PROVIDER={provider}.\n\n"
+            "Fix your `.env` to one of:\n"
+            "  # Google\n"
+            "  OSP_SOS_MODEL_PROVIDER=google_genai\n"
+            "  OSP_SOS_MODEL=gemini-2.5-pro\n"
+            "  GOOGLE_API_KEY=...\n\n"
+            "  # Groq (for openai/gpt-oss-120b)\n"
+            "  OSP_SOS_MODEL_PROVIDER=groq\n"
+            "  OSP_SOS_MODEL=openai/gpt-oss-120b\n"
+            "  GROQ_API_KEY=...\n"
+        )
+    if provider == "groq" and looks_like_gemini:
+        raise MissingLLMConfiguration(
+            f"Model '{model}' looks like Gemini, but provider is '{provider}'. "
+            "Set OSP_SOS_MODEL_PROVIDER=google_genai or use a Groq model id."
+        )
+    if provider == "openai" and (looks_like_groq or looks_like_gemini):
+        raise MissingLLMConfiguration(
+            f"Model '{model}' does not match provider '{provider}'. "
+            "Use an OpenAI model (e.g. gpt-4o-mini) or change OSP_SOS_MODEL_PROVIDER."
+        )
 
 
 def _init_llm(model: str | None = None, model_provider: str | None = None):
@@ -117,14 +173,21 @@ def _init_llm(model: str | None = None, model_provider: str | None = None):
     if _grok_key and not os.getenv("GROQ_API_KEY"):
         os.environ["GROQ_API_KEY"] = _grok_key
 
-    provider = model_provider or os.getenv("OSP_SOS_MODEL_PROVIDER", "groq")
-    resolved_model = model or os.getenv("OSP_SOS_MODEL", "openai/gpt-oss-120b")
+    provider = _normalize_provider(
+        model_provider or os.getenv("OSP_SOS_MODEL_PROVIDER", "groq")
+    )
+    resolved_model = (
+        (model or "").strip()
+        or os.getenv("OSP_SOS_MODEL", "").strip()
+        or _default_model(provider)
+    )
     required_key = _required_api_key(provider)
     if required_key and not os.getenv(required_key):
         raise MissingLLMConfiguration(
             f"LangGraph investigator with provider '{provider}' requires {required_key}. "
-            "Set it in .env, or run analyze with --offline."
+            "Set it in .env, or run analyze/chat with --offline."
         )
+    _validate_model_provider(resolved_model, provider)
 
     llm = init_chat_model(model=resolved_model, model_provider=provider)
     return llm.bind(parallel_tool_calls=False)
