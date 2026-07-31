@@ -80,7 +80,10 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             source_file TEXT,
             report_name TEXT,
             tags TEXT,
-            rhosp_version TEXT
+            rhosp_version TEXT,
+            hostname TEXT,
+            node_role TEXT,
+            cluster_id TEXT
         )
         """
     )
@@ -95,7 +98,10 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             source_file TEXT,
             report_name TEXT,
             tags TEXT,
-            rhosp_version TEXT
+            rhosp_version TEXT,
+            hostname TEXT,
+            node_role TEXT,
+            cluster_id TEXT
         )
         """
     )
@@ -115,7 +121,60 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cluster_nodes (
+            cluster_id TEXT,
+            hostname TEXT,
+            node_role TEXT,
+            rhosp_version TEXT,
+            services TEXT,
+            archive_name TEXT,
+            archive_id TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entities (
+            entity_id TEXT,
+            entity_type TEXT,
+            mention_count INTEGER,
+            first_seen TIMESTAMP,
+            last_seen TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entity_mentions (
+            entity_id TEXT,
+            entity_type TEXT,
+            timestamp TIMESTAMP,
+            hostname TEXT,
+            service TEXT,
+            level TEXT,
+            source_file TEXT,
+            report_name TEXT,
+            message_excerpt TEXT
+        )
+        """
+    )
+    _ensure_legacy_columns(conn)
     ensure_indexes(conn)
+
+
+def _ensure_legacy_columns(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add cluster identity columns to DBs created before this schema."""
+    for table, column in (
+        ("os_logs", "hostname"),
+        ("os_logs", "node_role"),
+        ("os_logs", "cluster_id"),
+        ("os_commands", "hostname"),
+        ("os_commands", "node_role"),
+        ("os_commands", "cluster_id"),
+    ):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} TEXT")
 
 
 def ensure_indexes(conn: duckdb.DuckDBPyConnection) -> None:
@@ -140,6 +199,12 @@ def ensure_indexes(conn: duckdb.DuckDBPyConnection) -> None:
     )
     conn.execute(
         """
+        CREATE INDEX IF NOT EXISTS idx_os_logs_hostname
+        ON os_logs(hostname)
+        """
+    )
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_os_commands_service
         ON os_commands(service)
         """
@@ -150,6 +215,81 @@ def ensure_indexes(conn: duckdb.DuckDBPyConnection) -> None:
         ON os_commands(report_name)
         """
     )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_cluster_nodes_hostname
+        ON cluster_nodes(hostname)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_entities_type
+        ON entities(entity_type)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity
+        ON entity_mentions(entity_id)
+        """
+    )
+
+
+def upsert_cluster_node(conn: duckdb.DuckDBPyConnection, row: Sequence[object]) -> None:
+    """Replace any prior row for the same archive_id/hostname in this cluster."""
+    cluster_id, hostname, _node_role, _version, _services, archive_name, archive_id = row
+    conn.execute(
+        """
+        DELETE FROM cluster_nodes
+        WHERE archive_id = ? OR (cluster_id = ? AND archive_name = ?)
+           OR (cluster_id = ? AND hostname = ? AND hostname != '')
+        """,
+        [archive_id, cluster_id, archive_name, cluster_id, hostname],
+    )
+    conn.execute(
+        """
+        INSERT INTO cluster_nodes (
+            cluster_id, hostname, node_role, rhosp_version, services,
+            archive_name, archive_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        list(row),
+    )
+
+
+def stamp_report_identity(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    report_name: str,
+    hostname: str,
+    node_role: str,
+    cluster_id: str,
+    rhosp_version: str,
+) -> None:
+    """Backfill identity columns for one archive after manifest is finalized."""
+    conn.execute(
+        """
+        UPDATE os_logs
+        SET hostname = ?,
+            node_role = ?,
+            cluster_id = ?,
+            rhosp_version = ?
+        WHERE report_name = ?
+        """,
+        [hostname, node_role, cluster_id, rhosp_version, report_name],
+    )
+    conn.execute(
+        """
+        UPDATE os_commands
+        SET hostname = ?,
+            node_role = ?,
+            cluster_id = ?,
+            rhosp_version = ?
+        WHERE report_name = ?
+        """,
+        [hostname, node_role, cluster_id, rhosp_version, report_name],
+    )
+
 
 def archive_already_ingested(conn: duckdb.DuckDBPyConnection, archive_id: str) -> bool:
     row = conn.execute(
@@ -290,6 +430,9 @@ def insert_logs(conn: duckdb.DuckDBPyConnection, entries: Sequence[LogEntry]) ->
             "report_name",
             "tags",
             "rhosp_version",
+            "hostname",
+            "node_role",
+            "cluster_id",
         ),
         [
             (
@@ -304,6 +447,9 @@ def insert_logs(conn: duckdb.DuckDBPyConnection, entries: Sequence[LogEntry]) ->
                 entry.report_name,
                 entry.tags,
                 entry.rhosp_version,
+                entry.hostname,
+                entry.node_role,
+                entry.cluster_id,
             )
             for entry in entries
         ],
@@ -329,6 +475,9 @@ def insert_commands(
             "report_name",
             "tags",
             "rhosp_version",
+            "hostname",
+            "node_role",
+            "cluster_id",
         ),
         [
             (
@@ -341,6 +490,9 @@ def insert_commands(
                 artifact.report_name,
                 artifact.tags,
                 artifact.rhosp_version,
+                artifact.hostname,
+                artifact.node_role,
+                artifact.cluster_id,
             )
             for artifact in artifacts
         ],

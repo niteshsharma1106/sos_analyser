@@ -9,6 +9,7 @@ import tarfile
 import tempfile
 import time
 from collections import deque
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -26,6 +27,14 @@ from .archive_reader import (
     read_text_member,
 )
 from .classification import build_tags, classify_service
+from .cluster_loader import (
+    NodeManifest,
+    absorb_manifest_member,
+    is_cluster_manifest_member,
+    new_node_manifest,
+    note_service_from_path,
+    resolve_cluster_id,
+)
 from .db import (
     archive_already_ingested,
     dedupe_ingested_rows,
@@ -35,7 +44,10 @@ from .db import (
     mark_archive_completed,
     mark_archive_failed,
     mark_archive_started,
+    stamp_report_identity,
+    upsert_cluster_node,
 )
+from .evidence_index import build_evidence_index
 from .log_parser import parse_log_lines
 from .models import CommandArtifact, IngestionStats, LogEntry
 
@@ -49,8 +61,21 @@ def _default_db_path(reports_dir: Path) -> Path:
     return reports_dir.parent / "sos_analysis.duckdb"
 
 
+def _with_identity(entry: LogEntry, manifest: NodeManifest) -> LogEntry:
+    return replace(
+        entry,
+        hostname=manifest.hostname,
+        node_role=manifest.node_role,
+        cluster_id=manifest.cluster_id,
+        rhosp_version=manifest.rhosp_version or entry.rhosp_version,
+    )
+
+
 def _command_artifact(
-    source_file: str, output: str, report_name: str
+    source_file: str,
+    output: str,
+    report_name: str,
+    manifest: NodeManifest,
 ) -> CommandArtifact:
     command = Path(source_file).name
     service, category = classify_service(command, source_file)
@@ -63,6 +88,10 @@ def _command_artifact(
         source_file=source_file,
         report_name=report_name,
         tags=build_tags(service, category, command, source_file),
+        rhosp_version=manifest.rhosp_version,
+        hostname=manifest.hostname,
+        node_role=manifest.node_role,
+        cluster_id=manifest.cluster_id,
     )
 
 
@@ -92,6 +121,9 @@ def _ingest_archive(
     max_file_size: int,
     large_log_threshold: int,
     large_log_tail_hours: float,
+    *,
+    archive_id: str,
+    cluster_id: str,
 ) -> IngestionStats:
     stats = IngestionStats(archives=1)
     report_name = archive_path.name
@@ -100,6 +132,9 @@ def _ingest_archive(
     command_index = 0
     members_seen = 0
     last_heartbeat = time.perf_counter()
+    manifest = new_node_manifest(
+        archive_path, archive_id=archive_id, cluster_id=cluster_id
+    )
 
     print(f"[progress] {report_name}: walking archive stream", flush=True)
     with tarfile.open(archive_path, "r|xz") as archive:
@@ -114,8 +149,17 @@ def _ingest_archive(
                 )
                 last_heartbeat = now
 
+            manifest_text: str | None = None
+            if is_cluster_manifest_member(member, max_file_size):
+                manifest_text = absorb_manifest_member(manifest, archive, member)
+
             if is_systemd_journal_member(member, max_file_size):
+                if manifest_text is not None:
+                    # Binary journals are never text manifest members; keep structure clear.
+                    pass
                 log_index += 1
+                source_file = normalized_member_name(member)
+                note_service_from_path(manifest, source_file)
                 rows = _ingest_systemd_journal_member(
                     conn=conn,
                     archive=archive,
@@ -127,12 +171,18 @@ def _ingest_archive(
                         if member.size > large_log_threshold
                         else None
                     ),
+                    manifest=manifest,
                 )
                 stats = stats.add(IngestionStats(log_files=1, log_rows=rows))
                 continue
 
             if is_interesting_log_member(member, max_file_size):
+                if manifest_text is not None:
+                    # Already consumed as text; skip re-read on streaming xz.
+                    continue
                 log_index += 1
+                source_file = normalized_member_name(member)
+                note_service_from_path(manifest, source_file)
                 rows = _ingest_log_member(
                     conn=conn,
                     archive=archive,
@@ -144,6 +194,7 @@ def _ingest_archive(
                         if member.size > large_log_threshold
                         else None
                     ),
+                    manifest=manifest,
                 )
                 stats = stats.add(IngestionStats(log_files=1, log_rows=rows))
                 continue
@@ -151,17 +202,24 @@ def _ingest_archive(
             if is_interesting_command_member(member, max_file_size):
                 command_index += 1
                 source_file = normalized_member_name(member)
+                note_service_from_path(manifest, source_file)
                 if command_index == 1 or command_index % 100 == 0:
                     print(
                         f"[progress] {report_name}: reading command artifact "
                         f"{command_index}: {source_file}",
                         flush=True,
                     )
+                output = (
+                    manifest_text
+                    if manifest_text is not None
+                    else read_text_member(archive, member)
+                )
                 command_batch.append(
                     _command_artifact(
                         source_file=source_file,
-                        output=read_text_member(archive, member),
+                        output=output,
                         report_name=report_name,
+                        manifest=manifest,
                     )
                 )
 
@@ -171,6 +229,21 @@ def _ingest_archive(
             command_files=command_index,
             command_rows=command_rows,
         )
+    )
+    stamp_report_identity(
+        conn,
+        report_name=report_name,
+        hostname=manifest.hostname,
+        node_role=manifest.node_role,
+        cluster_id=manifest.cluster_id,
+        rhosp_version=manifest.rhosp_version,
+    )
+    upsert_cluster_node(conn, manifest.as_row())
+    print(
+        f"[progress] {report_name}: cluster node "
+        f"host={manifest.hostname} role={manifest.node_role} "
+        f"cluster_id={manifest.cluster_id}",
+        flush=True,
     )
     print(
         f"[progress] {report_name}: finished archive: {stats.log_files} log file(s), "
@@ -187,6 +260,7 @@ def _ingest_log_member(
     report_name: str,
     log_index: int,
     retain_recent_hours: float | None = None,
+    manifest: NodeManifest | None = None,
 ) -> int:
     source_file = normalized_member_name(member)
     print(
@@ -209,6 +283,8 @@ def _ingest_log_member(
     for entry in parse_log_lines(
         iter_text_lines(archive, member), source_file, report_name
     ):
+        if manifest is not None:
+            entry = _with_identity(entry, manifest)
         if retain_recent_hours is not None:
             if entry.timestamp is None:
                 continue
@@ -277,6 +353,7 @@ def _ingest_systemd_journal_member(
     report_name: str,
     log_index: int,
     retain_recent_hours: float | None,
+    manifest: NodeManifest | None = None,
 ) -> int:
     source_file = normalized_member_name(member)
     print(
@@ -308,6 +385,7 @@ def _ingest_systemd_journal_member(
             source_file,
             report_name,
             retain_recent_hours,
+            manifest=manifest,
         )
         assert process.stderr is not None
         error_output = process.stderr.read().strip()
@@ -324,6 +402,7 @@ def _insert_parsed_log_entries(
     source_file: str,
     report_name: str,
     retain_recent_hours: float | None,
+    manifest: NodeManifest | None = None,
 ) -> int:
     """Insert parsed entries, retaining a rolling recent window when requested."""
     batch: list[LogEntry] = []
@@ -337,6 +416,8 @@ def _insert_parsed_log_entries(
             flush=True,
         )
     for entry in entries:
+        if manifest is not None:
+            entry = _with_identity(entry, manifest)
         if retain_recent_hours is not None:
             if entry.timestamp is None:
                 continue
@@ -373,6 +454,7 @@ def ingest_sos_reports(
     force_reingest: bool = False,
     large_log_threshold_mb: float = DEFAULT_LARGE_LOG_THRESHOLD_MB,
     large_log_tail_hours: float = DEFAULT_LARGE_LOG_TAIL_HOURS,
+    cluster_id: str | None = None,
 ) -> Path:
     """Ingest one or more RHOSP 17.x SOS report tar.xz archives into DuckDB."""
     root = Path(reports_dir or "SOS_REPORTS").resolve()
@@ -404,6 +486,14 @@ def ingest_sos_reports(
             conn.execute("DELETE FROM os_logs")
             conn.execute("DELETE FROM os_commands")
             conn.execute("DELETE FROM ingested_reports")
+            conn.execute("DELETE FROM cluster_nodes")
+            conn.execute("DELETE FROM entities")
+            conn.execute("DELETE FROM entity_mentions")
+
+        resolved_cluster_id = resolve_cluster_id(
+            conn, root, clear_existing=clear_existing, explicit=cluster_id
+        )
+        print(f"[progress] Cluster id: {resolved_cluster_id}", flush=True)
 
         for archive_index, archive_path in enumerate(archive_paths, start=1):
             print(
@@ -432,6 +522,8 @@ def ingest_sos_reports(
                     max_file_size,
                     large_log_threshold,
                     large_log_tail_hours,
+                    archive_id=archive_id,
+                    cluster_id=resolved_cluster_id,
                 )
                 removed_logs, removed_commands = dedupe_ingested_rows(conn)
                 if removed_logs or removed_commands:
@@ -450,6 +542,13 @@ def ingest_sos_reports(
             except Exception:
                 mark_archive_failed(conn, archive_id)
                 raise
+
+        index_stats = build_evidence_index(conn)
+        print(
+            "[progress] Evidence index: "
+            f"{index_stats['entities']} entit(y/ies), {index_stats['mentions']} mention(s)",
+            flush=True,
+        )
 
     print(
         "[progress] Ingestion complete: "

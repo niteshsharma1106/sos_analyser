@@ -17,6 +17,9 @@ class LogEntry:
     report_name: str
     tags: str
     rhosp_version: str = "17.x"
+    hostname: str = ""
+    node_role: str = ""
+    cluster_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,9 @@ class CommandArtifact:
     report_name: str
     tags: str
     rhosp_version: str = "17.x"
+    hostname: str = ""
+    node_role: str = ""
+    cluster_id: str = ""
 
 
 @dataclass(frozen=True)

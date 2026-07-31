@@ -198,6 +198,9 @@ def _with_message(entry: LogEntry, message_lines: list[str]) -> LogEntry:
         report_name=entry.report_name,
         tags=entry.tags,
         rhosp_version=entry.rhosp_version,
+        hostname=entry.hostname,
+        node_role=entry.node_role,
+        cluster_id=entry.cluster_id,
     )
 
 
