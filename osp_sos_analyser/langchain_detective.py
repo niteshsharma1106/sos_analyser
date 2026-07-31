@@ -59,7 +59,7 @@ def investigate_prompt_with_langchain(
     if os.getenv("OSP_SOS_SKIP_DOTENV") != "1":
         load_dotenv()
 
-    model_provider = os.getenv("OSP_SOS_MODEL_PROVIDER", "openai")
+    model_provider = os.getenv("OSP_SOS_MODEL_PROVIDER", "google")
     _grok_key = os.getenv("GROK_API_KEY")
     if _grok_key and not os.getenv("GROQ_API_KEY"):
         os.environ["GROQ_API_KEY"] = _grok_key
