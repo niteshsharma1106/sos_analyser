@@ -56,6 +56,13 @@ python main.py analyze "VMs on compute-03 suddenly lost network connectivity at 
 ```
 
 Phase 2 uses a LangChain tool-calling agent by default. Create a local `.env` file first.
+Model, provider, and API key are read **only** from `.env` (no hardcoded defaults in code).
+
+Copy the example and edit one provider block:
+
+```bash
+cp .env.example .env
+```
 
 **Google Gemini**
 
@@ -81,7 +88,7 @@ OSP_SOS_MODEL=gpt-4o-mini
 OSP_SOS_MODEL_PROVIDER=openai
 ```
 
-Provider and model must match. Putting a Groq model id under `google_genai` causes a 404.
+Keep a single provider block active. Provider and model must match. Putting a Groq model id under `google_genai` causes a 404.
 For local testing without an LLM, use the deterministic fallback:
 
 ```bash

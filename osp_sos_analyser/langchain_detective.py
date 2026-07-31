@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Literal
 
@@ -9,7 +8,6 @@ from pydantic import BaseModel, Field
 
 from .analysis import AnalysisStore
 from .evidence import extract_evidence_hints
-from .llm_client import MissingLLMConfiguration
 from .models import AgentFinding, CommandRecord, InvestigationReport, LogRecord
 
 
@@ -54,21 +52,12 @@ def investigate_prompt_with_langchain(
     prompt: str,
     model: str | None = None,
 ) -> InvestigationReport:
-    from dotenv import load_dotenv
+    from langchain.agents import create_agent
+    from langchain.chat_models import init_chat_model
 
-    if os.getenv("OSP_SOS_SKIP_DOTENV") != "1":
-        load_dotenv()
+    from .env_config import get_llm_settings
 
-    model_provider = os.getenv("OSP_SOS_MODEL_PROVIDER", "google")
-    _grok_key = os.getenv("GROK_API_KEY")
-    if _grok_key and not os.getenv("GROQ_API_KEY"):
-        os.environ["GROQ_API_KEY"] = _grok_key
-    required_key = _required_api_key(model_provider)
-    if required_key and not os.getenv(required_key):
-        raise MissingLLMConfiguration(
-            f"LangChain agent analysis with provider '{model_provider}' requires {required_key}. "
-            "Set it in .env, or run analyze with --offline."
-        )
+    settings = get_llm_settings(model=model)
 
     store = AnalysisStore(db_path)
     evidence_cache: list[LogRecord | CommandRecord] = []
@@ -76,12 +65,9 @@ def investigate_prompt_with_langchain(
 
     tools = _build_tools(store, evidence_cache, agent_notes)
 
-    from langchain.agents import create_agent
-    from langchain.chat_models import init_chat_model
-
     llm = init_chat_model(
-        model=model or os.getenv("OSP_SOS_MODEL", _default_model(model_provider)),
-        model_provider=model_provider,
+        model=settings.model,
+        model_provider=settings.provider,
     )
     
     agent = create_agent(
@@ -272,22 +258,6 @@ def _system_prompt() -> str:
         "Prioritize ERROR/CRITICAL, HTTP 4xx/5xx, tracebacks, 'not ready', failed, timeout, NoValidHost, binding, backend, and unreachable evidence. "
         "Return a concise RCA with confidence and recommended next checks."
     )
-
-
-def _required_api_key(model_provider: str) -> str | None:
-    provider = model_provider.lower().replace("-", "_")
-    if provider == "openai":
-        return "OPENAI_API_KEY"
-    if provider in {"google_genai", "google_vertexai", "google"}:
-        return "GOOGLE_API_KEY"
-    return None
-
-
-def _default_model(model_provider: str) -> str:
-    provider = model_provider.lower().replace("-", "_")
-    if provider in {"google_genai", "google"}:
-        return "gemini-2.5-pro"
-    return "gpt-5.5"
 
 
 def _timeline_from_evidence(

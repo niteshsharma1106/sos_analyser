@@ -8,6 +8,7 @@ from pathlib import Path
 import duckdb
 
 from .detective import investigate_prompt_offline
+from .env_config import describe_llm_settings, load_app_env
 from .evidence_index import get_cluster_manifest
 from .langgraph_investigator import (
     investigate_with_langgraph,
@@ -343,7 +344,7 @@ def _answer_question(
         result = investigate_with_langgraph(
             db_path=db,
             prompt=prompt,
-            model=model.strip() or None,
+            model=(model or "").strip() or None,
             focus_entity=focus_entity.strip() or None,
             answer_style=answer_style,
             include_graph=include_graph,
@@ -356,7 +357,8 @@ def _answer_question(
         log.warning("Missing LLM configuration: %s", exc)
         return (
             f"{exc}\n\n"
-            "Set your API key in `.env`, or enable **Offline mode** in settings."
+            "Configure `OSP_SOS_MODEL`, `OSP_SOS_MODEL_PROVIDER`, and the matching "
+            "API key in `.env`, or enable **Offline mode** in settings."
         )
     except Exception as exc:  # noqa: BLE001 - surface runtime errors in the chat UI
         log.exception("Chat investigation failed")
@@ -371,10 +373,13 @@ def build_chat_app(
 ):
     import gradio as gr
 
-    model_value = default_model or os.getenv("OSP_SOS_MODEL", "")
+    load_app_env()
+    # Optional CLI override only; empty means "use .env as-is".
+    cli_model = (default_model or "").strip()
     banner = ""
     if Path(default_db_path).exists():
         banner = _cluster_banner(default_db_path)
+    llm_status = describe_llm_settings()
 
     theme = gr.themes.Soft(
         primary_hue="teal",
@@ -446,6 +451,9 @@ def build_chat_app(
                     send = gr.Button("↑", elem_id="osp-send", scale=0)
 
             with gr.Accordion("Settings", open=False, elem_id="osp-settings"):
+                gr.Markdown(
+                    f"**LLM config** (from `.env` only — not editable here)\n\n`{llm_status}`"
+                )
                 db_path = gr.Textbox(
                     value=default_db_path,
                     label="DuckDB path",
@@ -455,11 +463,8 @@ def build_chat_app(
                     value=default_offline,
                     label="Offline mode (no LLM)",
                 )
-                model = gr.Textbox(
-                    value=model_value,
-                    label="Model override",
-                    placeholder="Uses OSP_SOS_MODEL from .env when empty",
-                )
+                # Hidden: optional CLI --model override only; UI never hardcodes a model.
+                model_state = gr.State(cli_model)
                 focus_entity = gr.Textbox(
                     value="",
                     label="Focused entity",
@@ -510,7 +515,7 @@ def build_chat_app(
                 history,
                 db_path_value,
                 offline_value,
-                model_value_in,
+                model_value_in or "",
                 focus_value,
                 graph_value,
                 style_value,
@@ -522,7 +527,7 @@ def build_chat_app(
         inputs = [
             db_path,
             offline,
-            model,
+            model_state,
             focus_entity,
             include_graph,
             answer_style,

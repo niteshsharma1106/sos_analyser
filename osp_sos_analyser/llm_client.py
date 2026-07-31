@@ -19,16 +19,21 @@ class MissingLLMConfiguration(RuntimeError):
 
 class OpenAIResponsesClient:
     def __init__(self, model: str | None = None) -> None:
-        api_key = os.getenv("OPENAI_API_KEY")
+        # Import locally to avoid circular import with env_config.
+        from .env_config import get_llm_settings
+
+        settings = get_llm_settings(model=model, model_provider="openai")
+        api_key = os.getenv(settings.api_key_env)
         if not api_key:
             raise MissingLLMConfiguration(
-                "LLM analysis requires OPENAI_API_KEY. Set it, or run analyze with --offline."
+                f"LLM analysis requires {settings.api_key_env} in `.env`. "
+                "Set it, or run analyze with --offline."
             )
 
         from openai import OpenAI
 
         self._client = OpenAI(api_key=api_key)
-        self._model = model or os.getenv("OSP_SOS_MODEL", "gpt-5.5")
+        self._model = settings.model
 
     def structured(self, schema: type[T], system: str, user: str) -> T:
         response = self._client.responses.parse(
