@@ -208,6 +208,9 @@ class AgentObservabilityCallback:
                 if isinstance(serialized, dict):
                     name = str(serialized.get("name") or "")
                 name = name or str(kwargs.get("name") or "tool")
+                run_id = kwargs.get("run_id")
+                if run_id is not None:
+                    outer._tool_runs[str(run_id)] = name
                 args: dict[str, Any]
                 if isinstance(input_str, dict):
                     args = input_str
@@ -216,13 +219,22 @@ class AgentObservabilityCallback:
                 outer.trace.tool_start(name, args)
 
             def on_tool_end(self, output, **kwargs):  # noqa: ANN001
-                name = str(kwargs.get("name") or "tool")
+                run_id = kwargs.get("run_id")
+                name = ""
+                if run_id is not None:
+                    name = outer._tool_runs.pop(str(run_id), "")
+                name = name or str(kwargs.get("name") or "tool")
                 outer.trace.tool_end(name, str(output))
 
             def on_tool_error(self, error, **kwargs):  # noqa: ANN001
-                name = str(kwargs.get("name") or "tool")
+                run_id = kwargs.get("run_id")
+                name = ""
+                if run_id is not None:
+                    name = outer._tool_runs.pop(str(run_id), "")
+                name = name or str(kwargs.get("name") or "tool")
                 outer.trace.error(f"Tool {name} failed: {error}")
 
+        self._tool_runs: dict[str, str] = {}
         self.handler = _Handler()
 
 

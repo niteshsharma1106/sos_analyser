@@ -248,3 +248,27 @@ class InvestigationToolsTests(unittest.TestCase):
                     }
                 )
                 self.assertIn("Kernel panic", cmds)
+
+                # Reboot searches must not keep a neutron service filter.
+                logs_reboot = tools["search_os_logs"].invoke(
+                    {
+                        "hostname": "comp008",
+                        "service": "neutron",
+                        "search_terms": "reboot OR panic OR watchdog",
+                        "limit": 10,
+                    }
+                )
+                self.assertIn("ignored service='neutron'", logs_reboot)
+                self.assertIn("panic", logs_reboot.lower())
+
+                # Term-filtered sos_commands should fall back to raw artifacts.
+                cmds_loose = tools["search_sos_commands"].invoke(
+                    {
+                        "hostname": "comp008",
+                        "command_pattern": "dmesg",
+                        "search_terms": "this-term-will-not-match-zzzz",
+                        "limit": 5,
+                    }
+                )
+                self.assertIn("unfiltered command artifacts", cmds_loose)
+                self.assertIn("Kernel panic", cmds_loose)

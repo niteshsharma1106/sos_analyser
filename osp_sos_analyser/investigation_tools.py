@@ -72,9 +72,13 @@ def format_manifest(conn: Any) -> str:
     return "\n".join(lines)
 
 
-def format_evidence_mentions(mentions: Sequence[EvidenceMention]) -> str:
+def format_evidence_mentions(
+    mentions: Sequence[EvidenceMention],
+    *,
+    empty: str = "No indexed evidence for that entity.",
+) -> str:
     if not mentions:
-        return "No indexed evidence for that entity."
+        return empty
     lines = []
     for item in mentions:
         lines.append(
@@ -341,13 +345,26 @@ def prefetch_investigation_digest(
 
 
 def build_langchain_tools(conn: Any):
-    """Create LangChain tools bound to an open DuckDB connection."""
+    """Create LangChain tools bound to an open DuckDB connection.
+
+    All tools share one DuckDB connection. Parallel tool calls race and return
+    crossed/empty results, so every tool body is serialized with a lock.
+    """
+    import threading
+
     from langchain_core.tools import tool
+
+    db_lock = threading.RLock()
+    reboot_term_re = re.compile(
+        r"\b(reboot|panic|watchdog|oom|shutdown|mce|hardware error|kernel)\b",
+        re.I,
+    )
 
     @tool
     def get_cluster_overview() -> str:
         """Return the Cluster Manifest: hostnames, roles, RHOSP version, and services per SOS node."""
-        return format_manifest(conn)
+        with db_lock:
+            return format_manifest(conn)
 
     @tool
     def compare_nodes(
@@ -360,20 +377,21 @@ def build_langchain_tools(conn: Any):
         Use this for multi-node incidents (controller vs compute) to see which node is noisy.
         Optional service filter (nova, neutron, ...). Optional level filter (ERROR, WARNING, ...).
         """
-        services = [service.strip()] if service.strip() else ()
-        levels = (
-            [part.strip().upper() for part in level.split(",") if part.strip()]
-            if level.strip()
-            else ("CRITICAL", "ERROR", "WARNING")
-        )
-        capped = max(1, min(int(limit), 100))
-        rows = compare_node_activity(
-            conn,
-            services=services,
-            levels=levels,
-            limit=capped,
-        )
-        return format_node_comparison(rows)
+        with db_lock:
+            services = [service.strip()] if service.strip() else ()
+            levels = (
+                [part.strip().upper() for part in level.split(",") if part.strip()]
+                if level.strip()
+                else ("CRITICAL", "ERROR", "WARNING")
+            )
+            capped = max(1, min(int(limit), 100))
+            rows = compare_node_activity(
+                conn,
+                services=services,
+                levels=levels,
+                limit=capped,
+            )
+            return format_node_comparison(rows)
 
     @tool
     def get_entity_evidence(
@@ -386,60 +404,70 @@ def build_langchain_tools(conn: Any):
         """
         Fetch indexed evidence for one canonical entity (instance/port/volume/network/req-/host).
         Prefer this over searching raw logs. Optional service/hostname/node_role filters.
-        For hostnames (full or short like comp008), also returns recent host activity.
+        For hostnames (full or short like comp008), also returns recent host activity
+        across all services (service= is ignored for the host-activity section).
         """
-        if not entity_id.strip():
-            return "entity_id is required."
-        services = [service] if service.strip() else ()
-        hostnames = resolve_hostnames(conn, hostname) if hostname.strip() else ()
-        node_roles = [node_role] if node_role.strip() else ()
-        capped = max(1, min(int(limit), 30))
-        eid = entity_id.strip()
-        resolved_hosts = resolve_hostnames(conn, eid)
-        entity = get_entity(conn, eid)
-        # Short host tokens often aren't the entity_id; resolve to full hostname entity.
-        if entity is None and resolved_hosts:
-            for host in resolved_hosts:
-                entity = get_entity(conn, host)
-                if entity:
-                    eid = host
-                    break
-            if entity is None:
-                eid = resolved_hosts[0]
-                hostnames = resolved_hosts
+        with db_lock:
+            if not entity_id.strip():
+                return "entity_id is required."
+            services = [service] if service.strip() else ()
+            hostnames = resolve_hostnames(conn, hostname) if hostname.strip() else ()
+            # Hostname scope already identifies the node; role filter is redundant and
+            # can exclude hosts still stored as role=unknown in older DBs.
+            node_roles = ()
+            if node_role.strip() and not (hostname.strip() or hostnames):
+                node_roles = (node_role.strip(),)
+            capped = max(1, min(int(limit), 30))
+            eid = entity_id.strip()
+            resolved_hosts = resolve_hostnames(conn, eid)
+            entity = get_entity(conn, eid)
+            if entity is None and resolved_hosts:
+                for host in resolved_hosts:
+                    entity = get_entity(conn, host)
+                    if entity:
+                        eid = host
+                        break
+                if entity is None:
+                    eid = resolved_hosts[0]
+                    hostnames = resolved_hosts
 
-        header = (
-            f"entity={entity.entity_id} type={entity.entity_type} mentions={entity.mention_count}\n"
-            if entity
-            else f"entity={eid} (not registered in entities table)\n"
-        )
-        mentions = get_evidence(
-            conn,
-            eid,
-            limit=capped,
-            services=services,
-            hostnames=hostnames,
-            node_roles=node_roles,
-        )
-        body = format_evidence_mentions(mentions)
-        host_for_activity = None
-        if entity and entity.entity_type == "host":
-            host_for_activity = entity.entity_id
-        elif resolved_hosts:
-            host_for_activity = resolved_hosts[0]
-        if host_for_activity:
-            host_rows = get_host_activity(
+            header = (
+                f"entity={entity.entity_id} type={entity.entity_type} mentions={entity.mention_count}\n"
+                if entity
+                else f"entity={eid} (not registered in entities table)\n"
+            )
+            mentions = get_evidence(
                 conn,
-                host_for_activity,
-                services=services,
+                eid,
                 limit=capped,
+                services=services,
+                hostnames=hostnames,
+                node_roles=node_roles,
             )
-            body = (
-                body
-                + "\n\nHost activity:\n"
-                + format_evidence_mentions(host_rows)
-            )
-        return header + body
+            body = format_evidence_mentions(mentions)
+            host_for_activity = None
+            if entity and entity.entity_type == "host":
+                host_for_activity = entity.entity_id
+            elif resolved_hosts:
+                host_for_activity = resolved_hosts[0]
+            if host_for_activity:
+                # Host activity must not inherit service=neutron from the agent —
+                # reboot/ovn/nova lines would disappear.
+                host_rows = get_host_activity(
+                    conn,
+                    host_for_activity,
+                    services=(),
+                    limit=capped,
+                )
+                body = (
+                    body
+                    + "\n\nHost activity:\n"
+                    + format_evidence_mentions(
+                        host_rows,
+                        empty="No recent WARNING/ERROR/INFO host logs for that hostname.",
+                    )
+                )
+            return header + body
 
     @tool
     def list_indexed_entities(entity_type: str = "", limit: int = 20) -> str:
@@ -447,17 +475,19 @@ def build_langchain_tools(conn: Any):
         List indexed entities. Optional entity_type: instance, volume, port, network,
         router, image, request, host, unknown.
         """
-        capped = max(1, min(int(limit), 50))
-        rows = list_entities(
-            conn,
-            entity_type=entity_type.strip() or None,
-            limit=capped,
-        )
-        if not rows:
-            return "No entities in the evidence index. Re-ingest SOS reports first."
-        return "\n".join(
-            f"{row.entity_id}|{row.entity_type}|mentions={row.mention_count}" for row in rows
-        )
+        with db_lock:
+            capped = max(1, min(int(limit), 50))
+            rows = list_entities(
+                conn,
+                entity_type=entity_type.strip() or None,
+                limit=capped,
+            )
+            if not rows:
+                return "No entities in the evidence index. Re-ingest SOS reports first."
+            return "\n".join(
+                f"{row.entity_id}|{row.entity_type}|mentions={row.mention_count}"
+                for row in rows
+            )
 
     @tool
     def search_os_logs(
@@ -473,47 +503,63 @@ def build_langchain_tools(conn: Any):
         Prefer get_entity_evidence when you have a UUID/req-id.
         Hostname may be short (comp008) or FQDN; it is resolved against cluster_nodes.
         For alternatives use OR, e.g. 'reboot OR panic OR watchdog'.
+        For reboot/crash searches leave service empty.
         """
-        capped = max(1, min(int(limit), 30))
-        hostnames = resolve_hostnames(conn, hostname) if hostname.strip() else ()
-        node_roles = [node_role.strip()] if node_role.strip() else ()
-        services = [service] if service.strip() else ()
-        if resource_id.strip():
-            entity = get_entity(conn, resource_id.strip())
-            mentions = get_evidence(
+        with db_lock:
+            capped = max(1, min(int(limit), 30))
+            hostnames = resolve_hostnames(conn, hostname) if hostname.strip() else ()
+            notes: list[str] = []
+            if hostname.strip() and hostnames and hostnames[0].lower() != hostname.strip().lower():
+                notes.append(f"resolved hostname {hostname!r} → {', '.join(hostnames)}")
+
+            # Reboot/crash evidence is rarely tagged as neutron/nova.
+            service_value = service.strip()
+            if service_value and reboot_term_re.search(search_terms or ""):
+                notes.append(f"ignored service={service_value!r} for reboot/crash search")
+                service_value = ""
+            services = [service_value] if service_value else ()
+
+            # Prefer hostname-only scope; role filter is optional fallback.
+            node_roles = ()
+            if node_role.strip() and not hostnames:
+                node_roles = (node_role.strip(),)
+            elif node_role.strip() and hostnames:
+                notes.append(f"ignored node_role={node_role!r} because hostname is set")
+
+            if resource_id.strip():
+                entity = get_entity(conn, resource_id.strip())
+                mentions = get_evidence(
+                    conn,
+                    resource_id.strip(),
+                    limit=capped,
+                    services=services,
+                    hostnames=hostnames,
+                    node_roles=node_roles,
+                )
+                if mentions:
+                    header = (
+                        f"entity={entity.entity_id} type={entity.entity_type} mentions={entity.mention_count}\n"
+                        if entity
+                        else f"entity={resource_id}\n"
+                    )
+                    return (
+                        "Indexed evidence (preferred):\n"
+                        + header
+                        + format_evidence_mentions(mentions)
+                        + "\n\n(Use get_entity_evidence for related IDs extracted from these digests.)"
+                    )
+
+            rows = search_logs_by_node(
                 conn,
-                resource_id.strip(),
-                limit=capped,
-                services=services,
                 hostnames=hostnames,
                 node_roles=node_roles,
+                services=services,
+                search_terms=search_terms,
+                resource_id=resource_id.strip(),
+                limit=capped,
             )
-            if mentions:
-                header = (
-                    f"entity={entity.entity_id} type={entity.entity_type} mentions={entity.mention_count}\n"
-                    if entity
-                    else f"entity={resource_id}\n"
-                )
-                return (
-                    "Indexed evidence (preferred):\n"
-                    + header
-                    + format_evidence_mentions(mentions)
-                    + "\n\n(Use get_entity_evidence for related IDs extracted from these digests.)"
-                )
-
-        rows = search_logs_by_node(
-            conn,
-            hostnames=hostnames,
-            node_roles=node_roles,
-            services=services,
-            search_terms=search_terms,
-            resource_id=resource_id.strip(),
-            limit=capped,
-        )
-        note = ""
-        if hostname.strip() and hostnames and hostnames[0].lower() != hostname.strip().lower():
-            note = f"(resolved hostname {hostname!r} → {', '.join(hostnames)})\n"
-        return note + format_node_log_rows(rows)
+            prefix = ("\n".join(f"({n})" for n in notes) + "\n") if notes else ""
+            return prefix + format_node_log_rows(rows)
 
     @tool
     def search_sos_commands(
@@ -525,26 +571,40 @@ def build_langchain_tools(conn: Any):
         """
         Search sos_commands outputs (dmesg, last, journalctl, uptime, ipmitool, ...).
         Critical for host reboot/crash RCA. Hostname may be short (comp008).
-        Examples: command_pattern='dmesg' or 'last'; search_terms='panic OR reboot OR MCE'.
+        Prefer command_pattern='dmesg,last,journalctl' with empty search_terms first.
         """
-        capped = max(1, min(int(limit), 20))
-        hostnames = resolve_hostnames(conn, hostname) if hostname.strip() else ()
-        patterns = (
-            [p.strip() for p in re.split(r"[,\s]+", command_pattern) if p.strip()]
-            if command_pattern.strip()
-            else list(REBOOT_COMMAND_PATTERNS)
-        )
-        rows = search_commands_by_node(
-            conn,
-            hostnames=hostnames,
-            command_patterns=patterns,
-            search_terms=search_terms,
-            limit=capped,
-        )
-        note = ""
-        if hostname.strip() and hostnames and hostnames[0].lower() != hostname.strip().lower():
-            note = f"(resolved hostname {hostname!r} → {', '.join(hostnames)})\n"
-        return note + format_command_rows(rows)
+        with db_lock:
+            capped = max(1, min(int(limit), 20))
+            hostnames = resolve_hostnames(conn, hostname) if hostname.strip() else ()
+            patterns = (
+                [p.strip() for p in re.split(r"[,\s]+", command_pattern) if p.strip()]
+                if command_pattern.strip()
+                else list(REBOOT_COMMAND_PATTERNS)
+            )
+            rows = search_commands_by_node(
+                conn,
+                hostnames=hostnames,
+                command_patterns=patterns,
+                search_terms=search_terms,
+                limit=capped,
+            )
+            # If term filter was too strict, return the raw command artifacts.
+            if not rows and search_terms.strip():
+                rows = search_commands_by_node(
+                    conn,
+                    hostnames=hostnames,
+                    command_patterns=patterns,
+                    search_terms="",
+                    limit=capped,
+                )
+                note = "(no output matched search_terms; showing unfiltered command artifacts)\n"
+            else:
+                note = ""
+            if hostname.strip() and hostnames and hostnames[0].lower() != hostname.strip().lower():
+                note = (
+                    f"(resolved hostname {hostname!r} → {', '.join(hostnames)})\n" + note
+                )
+            return note + format_command_rows(rows)
 
     @tool
     def get_related_entities(
@@ -557,21 +617,22 @@ def build_langchain_tools(conn: Any):
         Optional relation_type filter: instance_port, port_host, port_chassis,
         chassis_host, instance_host, volume_instance, request_touches.
         """
-        if not entity_id.strip():
-            return "entity_id is required."
-        types = [relation_type.strip()] if relation_type.strip() else ()
-        eid = entity_id.strip()
-        if get_entity(conn, eid) is None:
-            resolved = resolve_hostnames(conn, eid)
-            if resolved:
-                eid = resolved[0]
-        rows = fetch_related_entities(
-            conn,
-            eid,
-            relation_types=types,
-            limit=max(1, min(int(limit), 50)),
-        )
-        return format_relationships(rows)
+        with db_lock:
+            if not entity_id.strip():
+                return "entity_id is required."
+            types = [relation_type.strip()] if relation_type.strip() else ()
+            eid = entity_id.strip()
+            if get_entity(conn, eid) is None:
+                resolved = resolve_hostnames(conn, eid)
+                if resolved:
+                    eid = resolved[0]
+            rows = fetch_related_entities(
+                conn,
+                eid,
+                relation_types=types,
+                limit=max(1, min(int(limit), 50)),
+            )
+            return format_relationships(rows)
 
     @tool
     def get_operation_path(
@@ -585,21 +646,22 @@ def build_langchain_tools(conn: Any):
         Provide start_entity_id (UUID/hostname). Optional target_entity_id or
         target_type (host, chassis, instance, port, volume).
         """
-        if not start_entity_id.strip():
-            return "start_entity_id is required."
-        start = start_entity_id.strip()
-        if get_entity(conn, start) is None:
-            resolved = resolve_hostnames(conn, start)
-            if resolved:
-                start = resolved[0]
-        path = fetch_operation_path(
-            conn,
-            start,
-            target_entity_id=target_entity_id.strip(),
-            target_type=target_type.strip(),
-            max_hops=max(1, min(int(max_hops), 6)),
-        )
-        return format_operation_path(path, start_entity_id=start)
+        with db_lock:
+            if not start_entity_id.strip():
+                return "start_entity_id is required."
+            start = start_entity_id.strip()
+            if get_entity(conn, start) is None:
+                resolved = resolve_hostnames(conn, start)
+                if resolved:
+                    start = resolved[0]
+            path = fetch_operation_path(
+                conn,
+                start,
+                target_entity_id=target_entity_id.strip(),
+                target_type=target_type.strip(),
+                max_hops=max(1, min(int(max_hops), 6)),
+            )
+            return format_operation_path(path, start_entity_id=start)
 
     return [
         get_cluster_overview,
