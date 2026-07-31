@@ -54,8 +54,20 @@ def build_ingest_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-file-size-mb",
         type=int,
-        default=25,
-        help="Maximum file size in MB to process; larger files are skipped",
+        default=2048,
+        help="Hard maximum file size in MB to process (default: 2048)",
+    )
+    parser.add_argument(
+        "--large-log-threshold-mb",
+        type=float,
+        default=30,
+        help="Stream files above this size and retain only their newest time window (default: 30)",
+    )
+    parser.add_argument(
+        "--large-log-tail-hours",
+        type=float,
+        default=6,
+        help="Hours of timestamped records retained from files above the threshold (default: 6)",
     )
     parser.add_argument(
         "--force-reingest",
@@ -116,6 +128,8 @@ def main() -> None:
         clear_existing=args.clear_existing,
         max_file_size_mb=args.max_file_size_mb,
         force_reingest=args.force_reingest,
+        large_log_threshold_mb=args.large_log_threshold_mb,
+        large_log_tail_hours=args.large_log_tail_hours,
     )
     print(f"Ingestion complete. Database: {db_path}")
 

@@ -29,6 +29,25 @@ OVN_LOG_PATTERN = re.compile(
     r"(?P<message>.*)$"
 )
 
+# Traditional rsyslog messages and the default `journalctl` rendering:
+# Jul 28 14:05:01 controller-0 systemd[1]: Started ...
+SYSLOG_PATTERN = re.compile(
+    r"^(?P<timestamp>(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+    r"\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
+    r"(?P<host>\S+)\s+(?P<module>[^:\[]+?)(?:\[(?P<pid>\d+)\])?:\s*"
+    r"(?P<message>.*)$",
+    re.IGNORECASE,
+)
+
+# `journalctl --output=short-iso` rendering used for binary journal files.
+# Example: 2026-07-28T14:05:01+0530 ctl01 systemd[1]: Started service.
+JOURNAL_ISO_PATTERN = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+"
+    r"(?P<host>\S+)\s+(?P<module>[^:\[]+?)(?:\[(?P<pid>\d+)\])?:\s*"
+    r"(?P<message>.*)$"
+)
+
 # CRI-O/containerd stdout/stderr wrapper around a container's own log line:
 # <container-runtime-timestamp> stdout|stderr F|P <original line>
 CONTAINER_WRAPPER_PATTERN = re.compile(
@@ -60,6 +79,16 @@ def parse_log_timestamp(value: str) -> Optional[datetime]:
     return None
 
 
+def _parse_syslog_timestamp(value: str, report_name: str) -> Optional[datetime]:
+    """Parse a syslog timestamp, using the SOS report year when available."""
+    year_match = re.search(r"(?:^|-)20(\d{2})-\d{2}-\d{2}(?:-|\.)", report_name)
+    year = int(f"20{year_match.group(1)}") if year_match else datetime.now().year
+    try:
+        return datetime.strptime(f"{year} {value}", "%Y %b %d %H:%M:%S")
+    except ValueError:
+        return None
+
+
 def _entry_from_standard_match(match: re.Match[str], source_file: str, report_name: str) -> LogEntry:
     module = match.group("module")
     service, category = classify_service(module, source_file)
@@ -89,6 +118,47 @@ def _entry_from_ovn_match(match: re.Match[str], source_file: str, report_name: s
         timestamp=parse_log_timestamp(match.group("timestamp")),
         pid=None,
         level=level,
+        module=module,
+        message=match.group("message"),
+        service=service,
+        category=category,
+        source_file=source_file,
+        report_name=report_name,
+        tags=build_tags(service, category, module, source_file),
+    )
+
+
+def _entry_from_syslog_match(match: re.Match[str], source_file: str, report_name: str) -> LogEntry:
+    module = match.group("module").strip()
+    service, category = classify_service(module, source_file)
+    return LogEntry(
+        timestamp=_parse_syslog_timestamp(match.group("timestamp"), report_name),
+        pid=int(match.group("pid")) if match.group("pid") else None,
+        level="INFO",
+        module=module,
+        message=match.group("message"),
+        service=service,
+        category=category,
+        source_file=source_file,
+        report_name=report_name,
+        tags=build_tags(service, category, module, source_file),
+    )
+
+
+def _entry_from_journal_iso_match(match: re.Match[str], source_file: str, report_name: str) -> LogEntry:
+    module = match.group("module").strip()
+    service, category = classify_service(module, source_file)
+    try:
+        timestamp = datetime.fromisoformat(match.group("timestamp").replace("Z", "+00:00"))
+        # The rest of this project stores naive datetimes. Keep the wall-clock
+        # time emitted by journalctl, which is sufficient for SOS-local RCA.
+        timestamp = timestamp.replace(tzinfo=None)
+    except ValueError:
+        timestamp = None
+    return LogEntry(
+        timestamp=timestamp,
+        pid=int(match.group("pid")) if match.group("pid") else None,
+        level="INFO",
         module=module,
         message=match.group("message"),
         service=service,
@@ -145,14 +215,24 @@ def parse_log_lines(
         unwrapped = _unwrap_container_line(line)
         standard_match = STANDARD_LOG_PATTERN.match(unwrapped)
         ovn_match = None if standard_match else OVN_LOG_PATTERN.match(unwrapped)
+        syslog_match = None if standard_match or ovn_match else SYSLOG_PATTERN.match(unwrapped)
+        journal_iso_match = (
+            None
+            if standard_match or ovn_match or syslog_match
+            else JOURNAL_ISO_PATTERN.match(unwrapped)
+        )
 
-        if standard_match or ovn_match:
+        if standard_match or ovn_match or syslog_match or journal_iso_match:
             if current is not None:
                 yield _with_message(current, message_lines)
             current = (
                 _entry_from_standard_match(standard_match, source_file, report_name)
                 if standard_match
                 else _entry_from_ovn_match(ovn_match, source_file, report_name)
+                if ovn_match
+                else _entry_from_syslog_match(syslog_match, source_file, report_name)
+                if syslog_match
+                else _entry_from_journal_iso_match(journal_iso_match, source_file, report_name)
             )
             message_lines = [current.message]
             continue

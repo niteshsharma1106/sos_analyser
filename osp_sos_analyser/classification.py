@@ -21,6 +21,7 @@ SERVICE_RULES: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("aodh", "telemetry", ("aodh",), ("telemetry",)),
     ("tripleo", "deployment", ("tripleo", "director"), ("deployment",)),
     ("podman", "container-runtime", ("podman", "container"), ("container-runtime",)),
+    ("system", "system", ("journal", "journalctl", "messages", "syslog", "secure", "boot.log"), ("system",)),
 )
 
 LOG_SERVICE_TOKENS = tuple(
@@ -69,6 +70,8 @@ def build_tags(service: str, category: str, module: str, source_file: str) -> st
         tags.add("storage")
     if "tripleo" in combined:
         tags.add("tripleo")
+    if service == "system":
+        tags.add("system")
     if service != "unknown":
         tags.add(service)
 

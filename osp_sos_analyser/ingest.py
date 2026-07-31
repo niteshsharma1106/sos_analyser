@@ -3,8 +3,13 @@ from __future__ import annotations
 
 import os
 import hashlib
+import shutil
+import subprocess
 import tarfile
+import tempfile
 import time
+from collections import deque
+from datetime import timedelta
 from pathlib import Path
 
 import duckdb
@@ -14,6 +19,7 @@ from .archive_reader import (
     file_size_limit,
     is_interesting_command_member,
     is_interesting_log_member,
+    is_systemd_journal_member,
     iter_report_archives,
     iter_text_lines,
     normalized_member_name,
@@ -35,6 +41,8 @@ from .models import CommandArtifact, IngestionStats, LogEntry
 
 BATCH_SIZE = 1000
 HASH_CHUNK_SIZE = 8 * 1024 * 1024
+DEFAULT_LARGE_LOG_THRESHOLD_MB = 30
+DEFAULT_LARGE_LOG_TAIL_HOURS = 6
 
 
 def _default_db_path(reports_dir: Path) -> Path:
@@ -82,6 +90,8 @@ def _ingest_archive(
     conn: duckdb.DuckDBPyConnection,
     archive_path: Path,
     max_file_size: int,
+    large_log_threshold: int,
+    large_log_tail_hours: float,
 ) -> IngestionStats:
     stats = IngestionStats(archives=1)
     report_name = archive_path.name
@@ -104,6 +114,23 @@ def _ingest_archive(
                 )
                 last_heartbeat = now
 
+            if is_systemd_journal_member(member, max_file_size):
+                log_index += 1
+                rows = _ingest_systemd_journal_member(
+                    conn=conn,
+                    archive=archive,
+                    member=member,
+                    report_name=report_name,
+                    log_index=log_index,
+                    retain_recent_hours=(
+                        large_log_tail_hours
+                        if member.size > large_log_threshold
+                        else None
+                    ),
+                )
+                stats = stats.add(IngestionStats(log_files=1, log_rows=rows))
+                continue
+
             if is_interesting_log_member(member, max_file_size):
                 log_index += 1
                 rows = _ingest_log_member(
@@ -112,6 +139,11 @@ def _ingest_archive(
                     member=member,
                     report_name=report_name,
                     log_index=log_index,
+                    retain_recent_hours=(
+                        large_log_tail_hours
+                        if member.size > large_log_threshold
+                        else None
+                    ),
                 )
                 stats = stats.add(IngestionStats(log_files=1, log_rows=rows))
                 continue
@@ -154,6 +186,7 @@ def _ingest_log_member(
     member: tarfile.TarInfo,
     report_name: str,
     log_index: int,
+    retain_recent_hours: float | None = None,
 ) -> int:
     source_file = normalized_member_name(member)
     print(
@@ -165,9 +198,26 @@ def _ingest_log_member(
     batch: list[LogEntry] = []
     rows = 0
     started = time.perf_counter()
+    recent_entries: deque[LogEntry] = deque()
+    latest_timestamp = None
+    if retain_recent_hours is not None:
+        print(
+            f"[progress] {report_name}: {source_file}: retaining only the "
+            f"last {retain_recent_hours:g} hour(s) of timestamped records",
+            flush=True,
+        )
     for entry in parse_log_lines(
         iter_text_lines(archive, member), source_file, report_name
     ):
+        if retain_recent_hours is not None:
+            if entry.timestamp is None:
+                continue
+            latest_timestamp = max(latest_timestamp, entry.timestamp) if latest_timestamp else entry.timestamp
+            recent_entries.append(entry)
+            cutoff = latest_timestamp - timedelta(hours=retain_recent_hours)
+            while recent_entries and recent_entries[0].timestamp < cutoff:
+                recent_entries.popleft()
+            continue
         batch.append(entry)
         if len(batch) >= BATCH_SIZE:
             rows += insert_logs(conn, batch)
@@ -176,7 +226,20 @@ def _ingest_log_member(
                 f"[progress] {report_name}: {source_file}: {rows} row(s) loaded",
                 flush=True,
             )
-    rows += insert_logs(conn, batch)
+    if retain_recent_hours is not None:
+        if latest_timestamp is not None:
+            cutoff = latest_timestamp - timedelta(hours=retain_recent_hours)
+            batch = [entry for entry in recent_entries if entry.timestamp >= cutoff]
+            for offset in range(0, len(batch), BATCH_SIZE):
+                rows += insert_logs(conn, batch[offset : offset + BATCH_SIZE])
+        else:
+            print(
+                f"[progress] {report_name}: {source_file}: no timestamped records; "
+                "no rows retained from large file",
+                flush=True,
+            )
+    else:
+        rows += insert_logs(conn, batch)
     elapsed = time.perf_counter() - started
     print(
         f"[progress] {report_name}: finished {source_file}: "
@@ -186,12 +249,130 @@ def _ingest_log_member(
     return rows
 
 
+def _journalctl_command(journal_file: Path) -> list[str]:
+    """Build the local command that decodes one binary systemd journal."""
+    configured = os.getenv("OSP_SOS_JOURNALCTL_COMMAND")
+    if configured:
+        return configured.split() + ["--no-pager", "--output=short-iso", "--file", str(journal_file)]
+    if os.name != "nt":
+        return ["journalctl", "--no-pager", "--output=short-iso", "--file", str(journal_file)]
+
+    distro = os.getenv("OSP_SOS_WSL_DISTRO", "podman-machine-default")
+    mapped = subprocess.run(
+        ["wsl.exe", "-d", distro, "--", "wslpath", "-a", str(journal_file)],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    return [
+        "wsl.exe", "-d", distro, "--", "journalctl", "--no-pager",
+        "--output=short-iso", "--file", mapped,
+    ]
+
+
+def _ingest_systemd_journal_member(
+    conn: duckdb.DuckDBPyConnection,
+    archive: tarfile.TarFile,
+    member: tarfile.TarInfo,
+    report_name: str,
+    log_index: int,
+    retain_recent_hours: float | None,
+) -> int:
+    source_file = normalized_member_name(member)
+    print(
+        f"[progress] {report_name}: decoding binary journal {log_index} "
+        f"{source_file} ({member.size / 1024 / 1024:.1f} MB)",
+        flush=True,
+    )
+    extracted = archive.extractfile(member)
+    if extracted is None:
+        raise SosReportError(f"Unable to extract journal member: {member.name}")
+
+    with tempfile.TemporaryDirectory(prefix="osp-sos-journal-") as temporary_directory:
+        journal_file = Path(temporary_directory) / Path(source_file).name
+        with extracted, journal_file.open("wb") as destination:
+            shutil.copyfileobj(extracted, destination, length=1024 * 1024)
+
+        process = subprocess.Popen(
+            _journalctl_command(journal_file),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        assert process.stdout is not None
+        rows = _insert_parsed_log_entries(
+            conn,
+            parse_log_lines(process.stdout, source_file, report_name),
+            source_file,
+            report_name,
+            retain_recent_hours,
+        )
+        assert process.stderr is not None
+        error_output = process.stderr.read().strip()
+        if process.wait() != 0:
+            raise SosReportError(
+                f"journalctl could not decode {source_file}: {error_output or 'unknown error'}"
+            )
+    return rows
+
+
+def _insert_parsed_log_entries(
+    conn: duckdb.DuckDBPyConnection,
+    entries,
+    source_file: str,
+    report_name: str,
+    retain_recent_hours: float | None,
+) -> int:
+    """Insert parsed entries, retaining a rolling recent window when requested."""
+    batch: list[LogEntry] = []
+    rows = 0
+    recent_entries: deque[LogEntry] = deque()
+    latest_timestamp = None
+    if retain_recent_hours is not None:
+        print(
+            f"[progress] {report_name}: {source_file}: retaining only the "
+            f"last {retain_recent_hours:g} hour(s) of timestamped records",
+            flush=True,
+        )
+    for entry in entries:
+        if retain_recent_hours is not None:
+            if entry.timestamp is None:
+                continue
+            latest_timestamp = max(latest_timestamp, entry.timestamp) if latest_timestamp else entry.timestamp
+            recent_entries.append(entry)
+            cutoff = latest_timestamp - timedelta(hours=retain_recent_hours)
+            while recent_entries and recent_entries[0].timestamp < cutoff:
+                recent_entries.popleft()
+            continue
+        batch.append(entry)
+        if len(batch) >= BATCH_SIZE:
+            rows += insert_logs(conn, batch)
+            batch.clear()
+    if retain_recent_hours is None:
+        return rows + insert_logs(conn, batch)
+    if latest_timestamp is None:
+        print(
+            f"[progress] {report_name}: {source_file}: no timestamped records; no rows retained from large file",
+            flush=True,
+        )
+        return 0
+    cutoff = latest_timestamp - timedelta(hours=retain_recent_hours)
+    batch = [entry for entry in recent_entries if entry.timestamp >= cutoff]
+    for offset in range(0, len(batch), BATCH_SIZE):
+        rows += insert_logs(conn, batch[offset : offset + BATCH_SIZE])
+    return rows
+
+
 def ingest_sos_reports(
     reports_dir: str | os.PathLike[str] | None = None,
     db_path: str | os.PathLike[str] | None = None,
     clear_existing: bool = False,
-    max_file_size_mb: int | None = 25,
+    max_file_size_mb: int | None = 2048,
     force_reingest: bool = False,
+    large_log_threshold_mb: float = DEFAULT_LARGE_LOG_THRESHOLD_MB,
+    large_log_tail_hours: float = DEFAULT_LARGE_LOG_TAIL_HOURS,
 ) -> Path:
     """Ingest one or more RHOSP 17.x SOS report tar.xz archives into DuckDB."""
     root = Path(reports_dir or "SOS_REPORTS").resolve()
@@ -209,6 +390,11 @@ def ingest_sos_reports(
     db_target.parent.mkdir(parents=True, exist_ok=True)
 
     max_file_size = file_size_limit(max_file_size_mb)
+    if large_log_threshold_mb <= 0:
+        raise SosReportError("large_log_threshold_mb must be greater than zero")
+    if large_log_tail_hours <= 0:
+        raise SosReportError("large_log_tail_hours must be greater than zero")
+    large_log_threshold = int(large_log_threshold_mb * 1024 * 1024)
     total = IngestionStats()
 
     print(f"[progress] Found {len(archive_paths)} SOS archive(s)", flush=True)
@@ -240,7 +426,13 @@ def ingest_sos_reports(
             )
             mark_archive_started(conn, archive_id, archive_path)
             try:
-                archive_stats = _ingest_archive(conn, archive_path, max_file_size)
+                archive_stats = _ingest_archive(
+                    conn,
+                    archive_path,
+                    max_file_size,
+                    large_log_threshold,
+                    large_log_tail_hours,
+                )
                 removed_logs, removed_commands = dedupe_ingested_rows(conn)
                 if removed_logs or removed_commands:
                     print(
