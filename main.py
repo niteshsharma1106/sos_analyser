@@ -9,7 +9,10 @@ from typing import List, Optional
 from osp_sos_analyser.detective import investigate_prompt_offline
 from osp_sos_analyser.ingest import ingest_sos_reports
 from osp_sos_analyser.llm_client import MissingLLMConfiguration
-from osp_sos_analyser.langchain_detective import investigate_prompt_with_langchain
+from osp_sos_analyser.langgraph_investigator import (
+    investigate_with_langgraph,
+    render_investigation_result,
+)
 from pydantic import BaseModel, Field
 
 
@@ -103,18 +106,18 @@ def main() -> None:
         args = build_analyze_parser().parse_args(sys.argv[2:])
         if args.offline:
             report = investigate_prompt_offline(db_path=args.db_path, prompt=args.prompt)
+            print(report.render_markdown())
         else:
             try:
                 print(f"User Prompt: {args.prompt}")
-
-                report = investigate_prompt_with_langchain(
+                result = investigate_with_langgraph(
                     db_path=args.db_path,
                     prompt=args.prompt,
                     model=args.model,
                 )
             except MissingLLMConfiguration as exc:
                 raise SystemExit(str(exc)) from exc
-        print(report.render_markdown())
+            print(render_investigation_result(result))
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "ingest":

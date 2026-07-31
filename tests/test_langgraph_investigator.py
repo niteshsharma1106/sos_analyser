@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+import duckdb
+
+from osp_sos_analyser.db import ensure_schema
+from osp_sos_analyser.langgraph_investigator import (
+    ExpandedQuery,
+    InvestigationEntities,
+    _init_llm,
+    render_investigation_result,
+)
+from osp_sos_analyser.llm_client import MissingLLMConfiguration
+
+
+class LangGraphInvestigatorModuleTests(unittest.TestCase):
+    def test_expanded_query_model_accepts_notebook_shape(self) -> None:
+        plan = ExpandedQuery(
+            summary="Port binding failed",
+            intent="network_failure",
+            entities=InvestigationEntities(
+                resource_id="55ab45cf-6925-4811-a008-6fe60d491c5b",
+                resource_type="port",
+                service="neutron",
+            ),
+            keywords=["port", "binding", "55ab45cf-6925-4811-a008-6fe60d491c5b"],
+            investigation_targets=["neutron", "ovn"],
+            hypotheses=["OVN chassis issue"],
+        )
+        self.assertEqual(plan.entities.service, "neutron")
+        self.assertIn("binding", plan.keywords)
+
+    def test_render_investigation_result(self) -> None:
+        text = render_investigation_result(
+            {
+                "expanded_plan": ExpandedQuery(
+                    summary="host reboot",
+                    intent="system",
+                    entities=InvestigationEntities(service="system"),
+                    keywords=["reboot"],
+                    investigation_targets=["system"],
+                ),
+                "prefetch_digest": "cluster_id=abc",
+                "findings": {"investigator_raw": "checking kernel logs"},
+                "final_rca": "Likely kernel panic",
+            }
+        )
+        self.assertIn("Root Cause Analysis", text)
+        self.assertIn("Likely kernel panic", text)
+        self.assertIn("cluster_id=abc", text)
+
+    def test_init_llm_requires_api_key(self) -> None:
+        previous = {
+            key: os.environ.pop(key, None)
+            for key in ("GROQ_API_KEY", "GROK_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY")
+        }
+        os.environ["OSP_SOS_SKIP_DOTENV"] = "1"
+        try:
+            with self.assertRaises(MissingLLMConfiguration):
+                _init_llm(model="llama-3.1-8b-instant", model_provider="groq")
+        finally:
+            os.environ.pop("OSP_SOS_SKIP_DOTENV", None)
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_schema_ready_for_investigator_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "empty.duckdb"
+            with duckdb.connect(str(db_path)) as conn:
+                ensure_schema(conn)
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+                    ).fetchall()
+                }
+            self.assertIn("cluster_nodes", tables)
+            self.assertIn("entities", tables)
+            self.assertIn("entity_mentions", tables)
