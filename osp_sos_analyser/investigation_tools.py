@@ -15,7 +15,6 @@ from .evidence_index import (
     get_evidence,
     get_host_activity,
     list_entities,
-    parse_search_terms,
     search_commands_by_node,
     search_logs_by_node,
 )
