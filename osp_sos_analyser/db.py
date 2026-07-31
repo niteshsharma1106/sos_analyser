@@ -12,10 +12,26 @@ import duckdb
 from .models import CommandArtifact, LogEntry
 
 NULL_VALUE = r"\N"
+DEFAULT_MAX_LINE_SIZE = 100_000_000
+# Keep command artifacts searchable without blowing DuckDB CSV line limits.
+MAX_COMMAND_OUTPUT_CHARS = 512_000
 
 
 def _sql_string(value: str) -> str:
     return value.replace("'", "''")
+
+
+def _truncate_text(value: str, limit: int = MAX_COMMAND_OUTPUT_CHARS) -> str:
+    if len(value) <= limit:
+        return value
+    omitted = len(value) - limit
+    head = limit // 2
+    tail = limit - head
+    return (
+        f"{value[:head]}\n\n"
+        f"...[truncated {omitted} characters for ingest safety]...\n\n"
+        f"{value[-tail:]}"
+    )
 
 
 def _copy_rows(
@@ -36,11 +52,18 @@ def _copy_rows(
     )
     temp_path = Path(handle.name)
     try:
+        max_row_chars = 0
         with handle:
             writer = csv.writer(handle)
             for row in rows:
-                writer.writerow([NULL_VALUE if value is None else value for value in row])
+                rendered = [NULL_VALUE if value is None else value for value in row]
+                # Quoted CSV fields with embedded newlines are one DuckDB "line".
+                row_chars = sum(len(str(value)) for value in rendered) + len(rendered) * 4
+                if row_chars > max_row_chars:
+                    max_row_chars = row_chars
+                writer.writerow(rendered)
 
+        max_line_size = max(DEFAULT_MAX_LINE_SIZE, max_row_chars + 1024)
         conn.execute(
             f"""
             COPY {table} ({", ".join(columns)})
@@ -54,7 +77,7 @@ def _copy_rows(
                 ESCAPE '"',
                 NULL '{NULL_VALUE}',
                 STRICT_MODE false,
-                MAX_LINE_SIZE 100000000
+                MAX_LINE_SIZE {max_line_size}
             )
             """
         )
@@ -483,7 +506,7 @@ def insert_commands(
             (
                 artifact.source,
                 artifact.command,
-                artifact.output,
+                _truncate_text(artifact.output),
                 artifact.service,
                 artifact.category,
                 artifact.source_file,

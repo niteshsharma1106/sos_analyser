@@ -38,6 +38,26 @@ COMMAND_TOKENS = LOG_SERVICE_TOKENS + (
     "ss-",
 )
 
+# These tokens appear in many non-command SOS paths (e.g. pacemaker crm_report
+# messages.extract.txt). Only treat them as interesting under known plugins.
+SYSTEMISH_COMMAND_TOKENS = frozenset(
+    {"messages", "syslog", "secure", "boot.log", "journal", "journalctl"}
+)
+SYSTEMISH_COMMAND_PLUGINS = (
+    "/sos_commands/logs/",
+    "/sos_commands/systemd/",
+    "/sos_commands/kernel/",
+    "/sos_commands/filesys/",
+)
+
+# Bulk SOS report extracts that are not discrete command captures.
+LOW_VALUE_COMMAND_MARKERS = (
+    "/crm_report/",
+    ".extract.txt",
+    "/sos_commands/foreman/",
+    "/sos_commands/pulp/",
+)
+
 
 def classify_service(module: str, source_file: str) -> tuple[str, str]:
     source_lower = source_file.lower()

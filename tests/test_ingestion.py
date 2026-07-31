@@ -5,11 +5,56 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from osp_sos_analyser.archive_reader import is_interesting_command_member
+from osp_sos_analyser.db import MAX_COMMAND_OUTPUT_CHARS, ensure_schema, insert_commands
 from osp_sos_analyser.ingest import (
     ingest_sos_reports,
     windows_path_to_wsl,
 )
 from osp_sos_analyser.log_parser import parse_log_lines
+from osp_sos_analyser.models import CommandArtifact
+
+
+class CommandFilterAndInsertTests(unittest.TestCase):
+    def test_skips_pacemaker_crm_report_message_extracts(self) -> None:
+        info = tarfile.TarInfo(
+            "sos_commands/pacemaker/crm_report/host/messages.extract.txt"
+        )
+        info.size = 1024
+        self.assertFalse(is_interesting_command_member(info, max_file_size=10_000_000))
+
+    def test_keeps_systemd_journalctl_command_capture(self) -> None:
+        info = tarfile.TarInfo("sos_commands/systemd/journalctl_--no-pager_--boot")
+        info.size = 1024
+        self.assertTrue(is_interesting_command_member(info, max_file_size=10_000_000))
+
+    def test_insert_commands_truncates_huge_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "cmds.duckdb"
+            import duckdb
+
+            with duckdb.connect(str(db_path)) as conn:
+                ensure_schema(conn)
+                huge = "x" * (MAX_COMMAND_OUTPUT_CHARS + 50_000)
+                inserted = insert_commands(
+                    conn,
+                    [
+                        CommandArtifact(
+                            source="sos_commands/networking/ip_addr",
+                            command="ip_addr",
+                            output=huge,
+                            service="system",
+                            category="system",
+                            source_file="sos_commands/networking/ip_addr",
+                            report_name="report.tar.xz",
+                            tags="system",
+                        )
+                    ],
+                )
+                self.assertEqual(inserted, 1)
+                stored = conn.execute("SELECT output FROM os_commands").fetchone()[0]
+                self.assertLessEqual(len(stored), MAX_COMMAND_OUTPUT_CHARS + 80)
+                self.assertIn("truncated", stored)
 
 
 class JournalDecodeHelperTests(unittest.TestCase):

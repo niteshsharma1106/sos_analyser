@@ -222,6 +222,10 @@ def _ingest_archive(
                         manifest=manifest,
                     )
                 )
+                if len(command_batch) >= BATCH_SIZE:
+                    flushed = insert_commands(conn, command_batch)
+                    stats = stats.add(IngestionStats(command_rows=flushed))
+                    command_batch.clear()
 
     command_rows = insert_commands(conn, command_batch)
     stats = stats.add(

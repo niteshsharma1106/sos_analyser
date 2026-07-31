@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterator
 
-from .classification import COMMAND_TOKENS
+from .classification import (
+    COMMAND_TOKENS,
+    LOW_VALUE_COMMAND_MARKERS,
+    SYSTEMISH_COMMAND_PLUGINS,
+    SYSTEMISH_COMMAND_TOKENS,
+)
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -267,11 +272,23 @@ def is_interesting_command_member(
     if "sos_commands/" not in name:
         return False
 
-    if any(token in name for token in COMMAND_TOKENS):
-        SCAN_STATS.interesting_commands += 1
-        return True
+    if any(marker in name for marker in LOW_VALUE_COMMAND_MARKERS):
+        SCAN_STATS.skipped_pattern += 1
+        return False
 
-    return False
+    matched_tokens = [token for token in COMMAND_TOKENS if token in name]
+    if not matched_tokens:
+        return False
+
+    # Require system-ish tokens to live under known sos_commands plugins so we
+    # do not ingest multi-hundred-MB crm_report "messages" extracts.
+    if all(token in SYSTEMISH_COMMAND_TOKENS for token in matched_tokens):
+        if not any(plugin in f"/{name}" for plugin in SYSTEMISH_COMMAND_PLUGINS):
+            SCAN_STATS.skipped_pattern += 1
+            return False
+
+    SCAN_STATS.interesting_commands += 1
+    return True
 
 
 # -----------------------------------------------------------------------------
