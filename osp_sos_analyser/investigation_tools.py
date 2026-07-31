@@ -16,7 +16,12 @@ from .evidence_index import (
     list_entities,
     search_logs_by_node,
 )
-from .models import LogRecord
+from .relationship_graph import (
+    format_operation_path,
+    format_relationships,
+    get_operation_path as fetch_operation_path,
+    get_related_entities as fetch_related_entities,
+)
 
 
 def format_manifest(conn: Any) -> str:
@@ -173,7 +178,14 @@ def prefetch_investigation_digest(
                 else f"### {entity_id} (not in index)"
             )
             mentions = get_evidence(conn, entity_id, limit=limit_per_entity)
-            blocks.append(header + "\n" + format_evidence_mentions(mentions))
+            related = fetch_related_entities(conn, entity_id, limit=12)
+            path = fetch_operation_path(conn, entity_id, target_type="host", max_hops=4)
+            block = header + "\n" + format_evidence_mentions(mentions)
+            if related:
+                block += "\n\nRelated:\n" + format_relationships(related)
+            if path:
+                block += "\n\n" + format_operation_path(path, start_entity_id=entity_id)
+            blocks.append(block)
         sections.append("## Indexed entity evidence\n" + "\n\n".join(blocks))
     else:
         # Surface top entities so the agent has something concrete to start from.
@@ -341,10 +353,57 @@ def build_langchain_tools(conn: Any):
         )
         return format_node_log_rows(rows)
 
+    @tool
+    def get_related_entities(
+        entity_id: str,
+        relation_type: str = "",
+        limit: int = 20,
+    ) -> str:
+        """
+        Return graph neighbors for an instance/port/volume/request/host/chassis.
+        Optional relation_type filter: instance_port, port_host, port_chassis,
+        chassis_host, instance_host, volume_instance, request_touches.
+        """
+        if not entity_id.strip():
+            return "entity_id is required."
+        types = [relation_type.strip()] if relation_type.strip() else ()
+        rows = fetch_related_entities(
+            conn,
+            entity_id.strip(),
+            relation_types=types,
+            limit=max(1, min(int(limit), 50)),
+        )
+        return format_relationships(rows)
+
+    @tool
+    def get_operation_path(
+        start_entity_id: str,
+        target_entity_id: str = "",
+        target_type: str = "host",
+        max_hops: int = 4,
+    ) -> str:
+        """
+        Find a likely operation path such as VM -> port -> chassis -> host.
+        Provide start_entity_id (UUID/hostname). Optional target_entity_id or
+        target_type (host, chassis, instance, port, volume).
+        """
+        if not start_entity_id.strip():
+            return "start_entity_id is required."
+        path = fetch_operation_path(
+            conn,
+            start_entity_id.strip(),
+            target_entity_id=target_entity_id.strip(),
+            target_type=target_type.strip(),
+            max_hops=max(1, min(int(max_hops), 6)),
+        )
+        return format_operation_path(path, start_entity_id=start_entity_id.strip())
+
     return [
         get_cluster_overview,
         compare_nodes,
         get_entity_evidence,
+        get_related_entities,
+        get_operation_path,
         list_indexed_entities,
         search_os_logs,
     ]

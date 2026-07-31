@@ -48,6 +48,7 @@ from .db import (
     upsert_cluster_node,
 )
 from .evidence_index import build_evidence_index
+from .relationship_graph import build_relationship_index
 from .log_parser import parse_log_lines
 from .models import CommandArtifact, IngestionStats, LogEntry
 
@@ -615,6 +616,7 @@ def ingest_sos_reports(
             conn.execute("DELETE FROM cluster_nodes")
             conn.execute("DELETE FROM entities")
             conn.execute("DELETE FROM entity_mentions")
+            conn.execute("DELETE FROM entity_relationships")
 
         resolved_cluster_id = resolve_cluster_id(
             conn, root, clear_existing=clear_existing, explicit=cluster_id
@@ -673,6 +675,13 @@ def ingest_sos_reports(
         print(
             "[progress] Evidence index: "
             f"{index_stats['entities']} entit(y/ies), {index_stats['mentions']} mention(s)",
+            flush=True,
+        )
+        graph_stats = build_relationship_index(conn)
+        print(
+            "[progress] Relationship graph: "
+            f"{graph_stats['relationships']} edge(s), "
+            f"{graph_stats['chassis_entities']} chassis entit(y/ies)",
             flush=True,
         )
 

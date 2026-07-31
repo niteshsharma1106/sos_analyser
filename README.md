@@ -103,8 +103,20 @@ All nodes share one `cluster_id`. The chat/investigator can then:
 - `get_cluster_overview` — list hosts/roles
 - `compare_nodes` — ERROR/WARNING counts per host
 - `get_entity_evidence` / `search_os_logs` with `hostname=` or `node_role=` filters
+- `get_related_entities` / `get_operation_path` — VM↔port↔chassis↔host graph
+
+## Relationship / operation graph
+
+Ingest now builds `entity_relationships` from labelled log cues (`port_id`, `device_id`, `binding:host_id`, `chassis=...`). Ask:
+
+```text
+Show the VM → port → chassis → host path for port <uuid>
+```
+
+Or in the chat UI set **Focused entity** and **Operation path first**.
 
 ## Chat UI (ask / answer)
+
 
 
 After ingestion, launch an interactive chat UI instead of the CLI:

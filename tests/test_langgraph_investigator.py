@@ -181,3 +181,4 @@ class LangGraphInvestigatorModuleTests(unittest.TestCase):
             self.assertIn("cluster_nodes", tables)
             self.assertIn("entities", tables)
             self.assertIn("entity_mentions", tables)
+            self.assertIn("entity_relationships", tables)

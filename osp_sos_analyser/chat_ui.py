@@ -5,21 +5,59 @@ import argparse
 import os
 from pathlib import Path
 
+import duckdb
+
 from .detective import investigate_prompt_offline
+from .evidence_index import get_cluster_manifest
 from .langgraph_investigator import (
     investigate_with_langgraph,
     render_investigation_result,
 )
 from .llm_client import MissingLLMConfiguration
+from .relationship_graph import get_operation_path, get_related_entities, format_operation_path, format_relationships
 
 
 DEFAULT_DB_PATH = "sos_analysis.duckdb"
 DEFAULT_EXAMPLES = [
     "Why did compute-03 lose network connectivity?",
-    "Port 55ab45cf-6925-4811-a008-6fe60d491c5b failed to bind",
+    "Port 55ab45cf-6925-4811-a008-6fe60d491c5b failed to bind — show VM→port→chassis→host",
+    "What host is related to this VM/port failure?",
     "VM create failed with NoValidHost",
-    "Why did the controller reboot?",
+    "Compare controller vs compute errors for this incident",
 ]
+
+
+def _cluster_banner(db_path: str) -> str:
+    try:
+        with duckdb.connect(db_path, read_only=True) as conn:
+            nodes = get_cluster_manifest(conn)
+    except Exception:  # noqa: BLE001 - banner is best-effort
+        return ""
+    if not nodes:
+        return ""
+    roles = {}
+    for node in nodes:
+        roles.setdefault(node.get("node_role") or "unknown", []).append(node.get("hostname") or "?")
+    role_bits = ", ".join(f"{role}={len(hosts)}" for role, hosts in sorted(roles.items()))
+    return f"Cluster `{nodes[0].get('cluster_id')}` · nodes={len(nodes)} ({role_bits})"
+
+
+def _offline_graph_digest(db_path: str, focus_entity: str) -> str:
+    entity = (focus_entity or "").strip()
+    if not entity:
+        return ""
+    try:
+        with duckdb.connect(db_path, read_only=True) as conn:
+            related = get_related_entities(conn, entity, limit=15)
+            path = get_operation_path(conn, entity, target_type="host", max_hops=4)
+    except Exception as exc:  # noqa: BLE001
+        return f"Graph lookup failed: {exc}"
+    parts = []
+    if related:
+        parts.append("## Related entities\n" + format_relationships(related))
+    if path:
+        parts.append("## Operation path\n" + format_operation_path(path, start_entity_id=entity))
+    return "\n\n".join(parts)
 
 
 def _answer_question(
@@ -28,6 +66,9 @@ def _answer_question(
     db_path: str,
     offline: bool,
     model: str,
+    focus_entity: str = "",
+    include_graph: bool = True,
+    answer_style: str = "Concise RCA",
 ) -> str:
     prompt = (message or "").strip()
     if not prompt:
@@ -41,17 +82,28 @@ def _answer_question(
             "`uv run python main.py ingest --reports-dir SOS_REPORTS --db-path sos_analysis.duckdb`"
         )
 
+    banner = _cluster_banner(db)
+    prefix = f"{banner}\n\n" if banner else ""
+
     try:
         if offline:
             report = investigate_prompt_offline(db_path=db, prompt=prompt)
-            return report.render_markdown()
+            body = report.render_markdown()
+            if include_graph:
+                graph = _offline_graph_digest(db, focus_entity or prompt)
+                if graph:
+                    body = body + "\n\n" + graph
+            return prefix + body
 
         result = investigate_with_langgraph(
             db_path=db,
             prompt=prompt,
             model=model.strip() or None,
+            focus_entity=focus_entity.strip() or None,
+            answer_style=answer_style,
+            include_graph=include_graph,
         )
-        return render_investigation_result(result)
+        return prefix + render_investigation_result(result)
     except MissingLLMConfiguration as exc:
         return (
             f"{exc}\n\n"
@@ -69,23 +121,47 @@ def build_chat_app(
 ):
     import gradio as gr
 
-    def respond(message: str, history: list, db_path: str, offline: bool, model: str):
-        return _answer_question(message, history, db_path, offline, model)
+    def respond(
+        message: str,
+        history: list,
+        db_path: str,
+        offline: bool,
+        model: str,
+        focus_entity: str,
+        include_graph: bool,
+        answer_style: str,
+    ):
+        return _answer_question(
+            message,
+            history,
+            db_path,
+            offline,
+            model,
+            focus_entity,
+            include_graph,
+            answer_style,
+        )
 
     model_value = default_model or os.getenv("OSP_SOS_MODEL", "")
-    # Gradio requires list-of-lists examples when additional_inputs are present.
+    banner = ""
+    if Path(default_db_path).exists():
+        banner = _cluster_banner(default_db_path)
+    description = (
+        "Ask a question about your ingested RHOSP SOS reports. "
+        "Uses Cluster Manifest, Evidence Index, and VM↔port↔chassis↔host graph."
+    )
+    if banner:
+        description = f"{banner}\n\n{description}"
+
     examples = [
-        [prompt, default_db_path, default_offline, model_value]
+        [prompt, default_db_path, default_offline, model_value, "", True, "Concise RCA"]
         for prompt in DEFAULT_EXAMPLES
     ]
 
     chat = gr.ChatInterface(
         fn=respond,
         title="OSP SOS Investigator",
-        description=(
-            "Ask a question about your ingested RHOSP SOS reports. "
-            "Answers use the Cluster Manifest + Evidence Index when available."
-        ),
+        description=description,
         examples=examples,
         additional_inputs=[
             gr.Textbox(
@@ -102,6 +178,21 @@ def build_chat_app(
                 value=model_value,
                 label="Model override (optional)",
                 info="Defaults to OSP_SOS_MODEL / provider settings in .env",
+            ),
+            gr.Textbox(
+                value="",
+                label="Focused entity (optional)",
+                info="Seed with VM/port/volume/req-id/hostname/chassis",
+            ),
+            gr.Checkbox(
+                value=True,
+                label="Use relationship graph",
+                info="Prefer VM↔port↔chassis↔host path tools",
+            ),
+            gr.Radio(
+                choices=["Concise RCA", "Evidence-heavy", "Operation path first"],
+                value="Concise RCA",
+                label="Answer style",
             ),
         ],
         additional_inputs_accordion=gr.Accordion(label="Investigation settings", open=True),
@@ -150,7 +241,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--share",
         action="store_true",
-        help="Create a temporary public Gradio link",
+        help="Create a temporary public Gradio share link",
     )
     args = parser.parse_args(argv)
     launch_chat(

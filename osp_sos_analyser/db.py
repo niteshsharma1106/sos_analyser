@@ -183,6 +183,29 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entity_relationships (
+            src_entity_id TEXT,
+            src_entity_type TEXT,
+            relation_type TEXT,
+            dst_entity_id TEXT,
+            dst_entity_type TEXT,
+            evidence_count INTEGER,
+            confidence DOUBLE,
+            first_seen TIMESTAMP,
+            last_seen TIMESTAMP,
+            hostnames TEXT,
+            services TEXT,
+            sample_excerpt TEXT,
+            sample_hostname TEXT,
+            sample_service TEXT,
+            sample_level TEXT,
+            sample_source_file TEXT,
+            sample_report_name TEXT
+        )
+        """
+    )
     _ensure_legacy_columns(conn)
     ensure_indexes(conn)
 
@@ -254,6 +277,24 @@ def ensure_indexes(conn: duckdb.DuckDBPyConnection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity
         ON entity_mentions(entity_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_relationships_src
+        ON entity_relationships(src_entity_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_relationships_dst
+        ON entity_relationships(dst_entity_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_relationships_type
+        ON entity_relationships(relation_type)
         """
     )
 

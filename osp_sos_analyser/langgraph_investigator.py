@@ -35,10 +35,12 @@ Investigation order (mandatory):
 2) If multiple nodes are present, call compare_nodes to see which hosts are noisy.
 3) If you have a UUID/req-id/hostname, call get_entity_evidence first.
    Use hostname= or node_role= filters when the incident is node-specific.
-4) Extract related IDs from digests and query those with get_entity_evidence
+4) Call get_related_entities and get_operation_path to map
+   VM ↔ port ↔ chassis ↔ host (and volume ↔ instance when relevant).
+5) Extract related IDs from digests and query those with get_entity_evidence
    (ports/networks -> neutron/ovn, volumes/images -> cinder/glance, instances -> nova).
-5) Use list_indexed_entities if you need candidates by type.
-6) Use search_os_logs only as a fallback when the evidence index has no hits.
+6) Use list_indexed_entities if you need candidates by type.
+7) Use search_os_logs only as a fallback when the evidence/graph index has no hits.
    Prefer scoping with hostname= or node_role= (controller vs compute).
 
 Tool results are already digests. Do not paste them back in full.
@@ -349,11 +351,35 @@ def investigate_with_langgraph(
     model: str | None = None,
     model_provider: str | None = None,
     recursion_limit: int = 15,
+    focus_entity: str | None = None,
+    answer_style: str = "Concise RCA",
+    include_graph: bool = True,
 ) -> dict[str, Any]:
     """Run the notebook RCA workflow from a Python entrypoint."""
     from langchain_core.utils.uuid import uuid7
 
     from .dbconnector import DatabaseConnector
+
+    enriched = (prompt or "").strip()
+    extras: list[str] = []
+    if focus_entity and focus_entity.strip():
+        extras.append(f"Focused entity seed: {focus_entity.strip()}")
+    if include_graph:
+        extras.append(
+            "Prefer relationship graph tools (get_related_entities, get_operation_path) "
+            "to map VM↔port↔chassis↔host."
+        )
+    style = (answer_style or "Concise RCA").strip()
+    if style == "Evidence-heavy":
+        extras.append("Answer style: evidence-heavy — cite more digests and hostnames.")
+    elif style == "Operation path first":
+        extras.append(
+            "Answer style: start with the operation path (VM→port→chassis→host), then RCA."
+        )
+    else:
+        extras.append("Answer style: concise RCA.")
+    if extras:
+        enriched = enriched + "\n\n" + "\n".join(extras)
 
     with DatabaseConnector(db_path, read_only=True) as db:
         app = build_investigation_app(
@@ -362,18 +388,19 @@ def investigate_with_langgraph(
             model_provider=model_provider,
         )
         initial_state: InvestigationState = {
-            "raw_query": prompt,
+            "raw_query": enriched,
             "expanded_plan": None,
             "prefetch_digest": "",
             "gathered_evidence": [],
             "findings": {},
+            "final_rca": "",
             "next_node": "",
         }
-        run_config = {
-            "configurable": {"thread_id": str(uuid7())},
+        config = {
+            "run_id": uuid7(),
             "recursion_limit": recursion_limit,
         }
-        return app.invoke(initial_state, config=run_config)
+        return app.invoke(initial_state, config=config)
 
 
 def render_investigation_result(final_state: dict[str, Any]) -> str:

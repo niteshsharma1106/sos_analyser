@@ -149,3 +149,6 @@ class InvestigationToolsTests(unittest.TestCase):
                     resource_id=port_id,
                 )
                 self.assertIn("Cross-node activity", digest)
+
+                self.assertIn("get_related_entities", tools)
+                self.assertIn("get_operation_path", tools)
