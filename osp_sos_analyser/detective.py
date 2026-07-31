@@ -27,7 +27,23 @@ class DetectiveCoordinator:
         findings = tuple(agent.investigate(self.store, hints) for agent in selected_agents)
         services = _timeline_services(hints, findings)
         terms = hints.identifiers or hints.hostnames or hints.keywords
+
+        indexed_timeline: tuple = ()
         if hints.identifiers:
+            from .investigation_tools import indexed_evidence_for_hints
+
+            indexed_timeline = tuple(
+                indexed_evidence_for_hints(
+                    self.store._connect(),
+                    hints,
+                    services=services,
+                    limit=30,
+                )
+            )
+
+        if indexed_timeline:
+            timeline = indexed_timeline[:30]
+        elif hints.identifiers:
             timeline = self.store.find_identifier_events(
                 hints.identifiers[0],
                 services=services,

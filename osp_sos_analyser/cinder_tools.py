@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .analysis import AnalysisStore
+from .investigation_tools import indexed_evidence_for_hints
 from .models import AgentFinding, EvidenceHint, LogRecord
 
 
@@ -9,8 +10,14 @@ class CinderAgent:
     services = ("cinder",)
 
     def investigate(self, store: AnalysisStore, hints: EvidenceHint) -> AgentFinding:
-        terms = hints.identifiers or hints.hostnames or hints.keywords
-        evidence = list(store.search_logs(service="cinder", text_terms=terms[:2], limit=10))
+        evidence = indexed_evidence_for_hints(
+            store._connect(), hints, services=("cinder",), limit=10
+        )
+        if not evidence:
+            terms = hints.identifiers or hints.hostnames or hints.keywords
+            evidence = list(
+                store.search_logs(service="cinder", text_terms=terms[:2], limit=10)
+            )
         if not evidence:
             evidence = list(
                 store.search_logs(
