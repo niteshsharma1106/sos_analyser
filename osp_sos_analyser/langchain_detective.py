@@ -60,7 +60,9 @@ def investigate_prompt_with_langchain(
 
 
     model_provider = os.getenv("OSP_SOS_MODEL_PROVIDER", "openai")
-    os.environ["GROQ_API_KEY"]= os.getenv("GROK_API_KEY")
+    _grok_key = os.getenv("GROK_API_KEY")
+    if _grok_key:
+        os.environ["GROQ_API_KEY"] = _grok_key
     required_key = _required_api_key(model_provider)
     if required_key and not os.getenv(required_key):
         raise MissingLLMConfiguration(

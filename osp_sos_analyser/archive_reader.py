@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import codecs
+import hashlib
 import tarfile
 from pathlib import Path
 from typing import Iterator
@@ -16,6 +17,7 @@ LOW_VALUE_LOG_PATTERNS = (
     "access.log",
     "_error.log",
 )
+_HASH_CHUNK_SIZE = 1024 * 1024
 
 
 class SosReportError(RuntimeError):
@@ -26,32 +28,36 @@ def normalized_member_name(member: tarfile.TarInfo) -> str:
     return member.name.replace("\\", "/").lstrip("./")
 
 
-def _archive_content_signature(path: Path) -> frozenset[tuple[str, int]]:
-    """Fingerprint an archive by its internal (member path, size) pairs.
+def archive_file_fingerprint(path: Path) -> tuple[int, str]:
+    """Cheap exact-file fingerprint: (size, sha256) without xz member decompress."""
+    size = path.stat().st_size
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(_HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return size, digest.hexdigest()
 
-    This catches duplicate sosreports that were re-tarred, renamed, or
-    recompressed differently — cases where the outer file bytes/hash differ
-    but the actual log content inside is the same. We strip the report-name
-    root prefix (the first path segment) before comparing, since two exports
-    of the same sosreport often differ only in that top-level folder name
-    (e.g. 'sosreport-host-case123/...' vs 'sosreport_log/sosreport/...').
-    """
-    signature: set[tuple[str, int]] = set()
-    try:
-        with tarfile.open(path, "r|xz") as archive:
-            for member in archive:
-                if not member.isreg():
-                    continue
-                name = normalized_member_name(member)
-                parts = name.split("/", 1)
-                relative_name = parts[1] if len(parts) > 1 else name
-                signature.add((relative_name, member.size))
-    except (tarfile.TarError, OSError) as exc:
-        raise SosReportError(f"Failed to read archive for dedup check: {path}: {exc}") from exc
-    return frozenset(signature)
+
+def member_content_signature_key(member: tarfile.TarInfo) -> tuple[str, int] | None:
+    """Relative (path, size) pair used for content-level archive dedupe."""
+    if not member.isreg():
+        return None
+    name = normalized_member_name(member)
+    parts = name.split("/", 1)
+    relative_name = parts[1] if len(parts) > 1 else name
+    return relative_name, member.size
 
 
 def iter_report_archives(reports_dir: Path) -> Iterator[Path]:
+    """Yield unique SOS archives.
+
+    Exact byte-identical copies are skipped via size+sha256 without decompressing
+    the xz stream. Renamed/re-tarred content duplicates are handled during ingest
+    by building a member listing signature while streaming (one decompress).
+    """
     if not reports_dir.exists():
         return
 
@@ -62,18 +68,20 @@ def iter_report_archives(reports_dir: Path) -> Iterator[Path]:
         elif path.is_dir():
             candidates.extend(sorted(path.rglob("*.tar.xz")))
 
-    seen_signatures: dict[frozenset[tuple[str, int]], Path] = {}
+    seen_file_fingerprints: dict[tuple[int, str], Path] = {}
     for path in candidates:
-        signature = _archive_content_signature(path)
-        existing = seen_signatures.get(signature)
+        try:
+            fingerprint = archive_file_fingerprint(path)
+        except OSError as exc:
+            raise SosReportError(f"Failed to fingerprint archive: {path}: {exc}") from exc
+        existing = seen_file_fingerprints.get(fingerprint)
         if existing is not None:
             print(
-                f"[skip] {path} appears to be a duplicate of {existing} "
-                f"(same internal file listing) — skipping ingestion.",
+                f"[skip] {path} is a byte-identical copy of {existing} — skipping.",
                 flush=True,
             )
             continue
-        seen_signatures[signature] = path
+        seen_file_fingerprints[fingerprint] = path
         yield path
 
 
