@@ -1,13 +1,15 @@
 # ingest.py
 from __future__ import annotations
 
-import hashlib
-import io
 import os
-import tempfile
+import hashlib
+import shutil
+import subprocess
 import tarfile
+import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from datetime import timedelta
 from pathlib import Path
 
 import duckdb
@@ -17,17 +19,30 @@ from .archive_reader import (
     file_size_limit,
     is_interesting_command_member,
     is_interesting_log_member,
+    is_systemd_journal_member,
     iter_report_archives,
-    member_content_signature_key,
+    iter_text_lines,
     normalized_member_name,
     read_text_member,
 )
 from .classification import build_tags, classify_service
-from .db import ensure_schema, insert_commands, insert_logs
+from .db import (
+    archive_already_ingested,
+    dedupe_ingested_rows,
+    ensure_schema,
+    insert_commands,
+    insert_logs,
+    mark_archive_completed,
+    mark_archive_failed,
+    mark_archive_started,
+)
 from .log_parser import parse_log_lines
 from .models import CommandArtifact, IngestionStats, LogEntry
 
 BATCH_SIZE = 1000
+HASH_CHUNK_SIZE = 8 * 1024 * 1024
+DEFAULT_LARGE_LOG_THRESHOLD_MB = 30
+DEFAULT_LARGE_LOG_TAIL_HOURS = 6
 
 
 def _default_db_path(reports_dir: Path) -> Path:
@@ -51,46 +66,85 @@ def _command_artifact(
     )
 
 
-def _signature_entry(
-    member: tarfile.TarInfo, content_digest: str = ""
-) -> tuple[str, int, str] | None:
-    key = member_content_signature_key(member)
-    if key is None:
-        return None
-    relative_name, size = key
-    return relative_name, size, content_digest
-
-
-def _digest_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+def _archive_id(archive_path: Path) -> str:
+    digest = hashlib.sha256()
+    total_size = archive_path.stat().st_size
+    bytes_read = 0
+    last_heartbeat = time.perf_counter()
+    with archive_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(HASH_CHUNK_SIZE), b""):
+            digest.update(chunk)
+            bytes_read += len(chunk)
+            now = time.perf_counter()
+            if total_size >= 256 * 1024 * 1024 and now - last_heartbeat >= 10:
+                print(
+                    f"[progress] {archive_path.name}: duplicate-check hash "
+                    f"{bytes_read / total_size:.0%}",
+                    flush=True,
+                )
+                last_heartbeat = now
+    return digest.hexdigest()
 
 
 def _ingest_archive(
     conn: duckdb.DuckDBPyConnection,
     archive_path: Path,
     max_file_size: int,
-) -> tuple[IngestionStats, frozenset[tuple[str, int, str]]]:
+    large_log_threshold: int,
+    large_log_tail_hours: float,
+) -> IngestionStats:
     stats = IngestionStats(archives=1)
     report_name = archive_path.name
     command_batch: list[CommandArtifact] = []
     log_index = 0
     command_index = 0
-    signature: set[tuple[str, int, str]] = set()
+    members_seen = 0
+    last_heartbeat = time.perf_counter()
 
+    print(f"[progress] {report_name}: walking archive stream", flush=True)
     with tarfile.open(archive_path, "r|xz") as archive:
         for member in archive:
-            if is_interesting_log_member(member, max_file_size):
+            members_seen += 1
+            now = time.perf_counter()
+            if members_seen == 1 or members_seen % 1000 == 0 or now - last_heartbeat >= 15:
+                print(
+                    f"[progress] {report_name}: scanned {members_seen} archive member(s); "
+                    f"matched {log_index} log file(s), {command_index} command artifact(s)",
+                    flush=True,
+                )
+                last_heartbeat = now
+
+            if is_systemd_journal_member(member, max_file_size):
                 log_index += 1
-                rows, content_digest = _ingest_log_member(
+                rows = _ingest_systemd_journal_member(
                     conn=conn,
                     archive=archive,
                     member=member,
                     report_name=report_name,
                     log_index=log_index,
+                    retain_recent_hours=(
+                        large_log_tail_hours
+                        if member.size > large_log_threshold
+                        else None
+                    ),
                 )
-                entry = _signature_entry(member, content_digest)
-                if entry is not None:
-                    signature.add(entry)
+                stats = stats.add(IngestionStats(log_files=1, log_rows=rows))
+                continue
+
+            if is_interesting_log_member(member, max_file_size):
+                log_index += 1
+                rows = _ingest_log_member(
+                    conn=conn,
+                    archive=archive,
+                    member=member,
+                    report_name=report_name,
+                    log_index=log_index,
+                    retain_recent_hours=(
+                        large_log_tail_hours
+                        if member.size > large_log_threshold
+                        else None
+                    ),
+                )
                 stats = stats.add(IngestionStats(log_files=1, log_rows=rows))
                 continue
 
@@ -103,37 +157,27 @@ def _ingest_archive(
                         f"{command_index}: {source_file}",
                         flush=True,
                     )
-                output = read_text_member(archive, member)
-                entry = _signature_entry(member, _digest_text(output))
-                if entry is not None:
-                    signature.add(entry)
                 command_batch.append(
                     _command_artifact(
                         source_file=source_file,
-                        output=output,
+                        output=read_text_member(archive, member),
                         report_name=report_name,
                     )
                 )
-                if len(command_batch) >= BATCH_SIZE:
-                    stats = stats.add(
-                        IngestionStats(command_rows=insert_commands(conn, command_batch))
-                    )
-                    command_batch.clear()
-                continue
 
-            entry = _signature_entry(member)
-            if entry is not None:
-                signature.add(entry)
-
-    if command_batch:
-        stats = stats.add(IngestionStats(command_rows=insert_commands(conn, command_batch)))
-    stats = stats.add(IngestionStats(command_files=command_index))
+    command_rows = insert_commands(conn, command_batch)
+    stats = stats.add(
+        IngestionStats(
+            command_files=command_index,
+            command_rows=command_rows,
+        )
+    )
     print(
         f"[progress] {report_name}: finished archive: {stats.log_files} log file(s), "
-        f"{stats.command_files} command artifact(s)",
+        f"{stats.command_files} command artifact(s), {members_seen} archive member(s) scanned",
         flush=True,
     )
-    return stats, frozenset(signature)
+    return stats
 
 
 def _ingest_log_member(
@@ -142,7 +186,8 @@ def _ingest_log_member(
     member: tarfile.TarInfo,
     report_name: str,
     log_index: int,
-) -> tuple[int, str]:
+    retain_recent_hours: float | None = None,
+) -> int:
     source_file = normalized_member_name(member)
     print(
         f"[progress] {report_name}: parsing log {log_index} "
@@ -150,14 +195,29 @@ def _ingest_log_member(
         flush=True,
     )
 
-    # Read once so we can fingerprint content without a second decompress pass.
-    text = read_text_member(archive, member)
-    content_digest = _digest_text(text)
-
     batch: list[LogEntry] = []
     rows = 0
     started = time.perf_counter()
-    for entry in parse_log_lines(io.StringIO(text), source_file, report_name):
+    recent_entries: deque[LogEntry] = deque()
+    latest_timestamp = None
+    if retain_recent_hours is not None:
+        print(
+            f"[progress] {report_name}: {source_file}: retaining only the "
+            f"last {retain_recent_hours:g} hour(s) of timestamped records",
+            flush=True,
+        )
+    for entry in parse_log_lines(
+        iter_text_lines(archive, member), source_file, report_name
+    ):
+        if retain_recent_hours is not None:
+            if entry.timestamp is None:
+                continue
+            latest_timestamp = max(latest_timestamp, entry.timestamp) if latest_timestamp else entry.timestamp
+            recent_entries.append(entry)
+            cutoff = latest_timestamp - timedelta(hours=retain_recent_hours)
+            while recent_entries and recent_entries[0].timestamp < cutoff:
+                recent_entries.popleft()
+            continue
         batch.append(entry)
         if len(batch) >= BATCH_SIZE:
             rows += insert_logs(conn, batch)
@@ -166,64 +226,153 @@ def _ingest_log_member(
                 f"[progress] {report_name}: {source_file}: {rows} row(s) loaded",
                 flush=True,
             )
-    rows += insert_logs(conn, batch)
+    if retain_recent_hours is not None:
+        if latest_timestamp is not None:
+            cutoff = latest_timestamp - timedelta(hours=retain_recent_hours)
+            batch = [entry for entry in recent_entries if entry.timestamp >= cutoff]
+            for offset in range(0, len(batch), BATCH_SIZE):
+                rows += insert_logs(conn, batch[offset : offset + BATCH_SIZE])
+        else:
+            print(
+                f"[progress] {report_name}: {source_file}: no timestamped records; "
+                "no rows retained from large file",
+                flush=True,
+            )
+    else:
+        rows += insert_logs(conn, batch)
     elapsed = time.perf_counter() - started
     print(
         f"[progress] {report_name}: finished {source_file}: "
         f"{rows} row(s) in {elapsed:.1f}s",
         flush=True,
     )
-    return rows, content_digest
+    return rows
 
 
-def _delete_report_rows(conn: duckdb.DuckDBPyConnection, report_name: str) -> None:
-    conn.execute("DELETE FROM os_logs WHERE report_name = ?", [report_name])
-    conn.execute("DELETE FROM os_commands WHERE report_name = ?", [report_name])
+def _journalctl_command(journal_file: Path) -> list[str]:
+    """Build the local command that decodes one binary systemd journal."""
+    configured = os.getenv("OSP_SOS_JOURNALCTL_COMMAND")
+    if configured:
+        return configured.split() + ["--no-pager", "--output=short-iso", "--file", str(journal_file)]
+    if os.name != "nt":
+        return ["journalctl", "--no-pager", "--output=short-iso", "--file", str(journal_file)]
+
+    distro = os.getenv("OSP_SOS_WSL_DISTRO", "podman-machine-default")
+    mapped = subprocess.run(
+        ["wsl.exe", "-d", distro, "--", "wslpath", "-a", str(journal_file)],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    return [
+        "wsl.exe", "-d", distro, "--", "journalctl", "--no-pager",
+        "--output=short-iso", "--file", mapped,
+    ]
 
 
-def _ingest_archive_to_temp(
-    archive_path: Path,
-    max_file_size: int,
-) -> tuple[Path, IngestionStats, frozenset[tuple[str, int, str]]]:
-    handle = tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False)
-    handle.close()
-    temp_path = Path(handle.name)
-    temp_path.unlink(missing_ok=True)
-    try:
-        with duckdb.connect(str(temp_path)) as conn:
-            ensure_schema(conn)
-            stats, signature = _ingest_archive(conn, archive_path, max_file_size)
-        return temp_path, stats, signature
-    except Exception:
-        temp_path.unlink(missing_ok=True)
-        raise
+def _ingest_systemd_journal_member(
+    conn: duckdb.DuckDBPyConnection,
+    archive: tarfile.TarFile,
+    member: tarfile.TarInfo,
+    report_name: str,
+    log_index: int,
+    retain_recent_hours: float | None,
+) -> int:
+    source_file = normalized_member_name(member)
+    print(
+        f"[progress] {report_name}: decoding binary journal {log_index} "
+        f"{source_file} ({member.size / 1024 / 1024:.1f} MB)",
+        flush=True,
+    )
+    extracted = archive.extractfile(member)
+    if extracted is None:
+        raise SosReportError(f"Unable to extract journal member: {member.name}")
 
+    with tempfile.TemporaryDirectory(prefix="osp-sos-journal-") as temporary_directory:
+        journal_file = Path(temporary_directory) / Path(source_file).name
+        with extracted, journal_file.open("wb") as destination:
+            shutil.copyfileobj(extracted, destination, length=1024 * 1024)
 
-def _merge_temp_db(conn: duckdb.DuckDBPyConnection, temp_path: Path, alias: str) -> None:
-    conn.execute(f"ATTACH '{temp_path.as_posix()}' AS {alias} (READ_ONLY)")
-    try:
-        conn.execute(
-            f"""
-            INSERT INTO os_logs
-            SELECT * FROM {alias}.os_logs
-            """
+        process = subprocess.Popen(
+            _journalctl_command(journal_file),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-        conn.execute(
-            f"""
-            INSERT INTO os_commands
-            SELECT * FROM {alias}.os_commands
-            """
+        assert process.stdout is not None
+        rows = _insert_parsed_log_entries(
+            conn,
+            parse_log_lines(process.stdout, source_file, report_name),
+            source_file,
+            report_name,
+            retain_recent_hours,
         )
-    finally:
-        conn.execute(f"DETACH {alias}")
+        assert process.stderr is not None
+        error_output = process.stderr.read().strip()
+        if process.wait() != 0:
+            raise SosReportError(
+                f"journalctl could not decode {source_file}: {error_output or 'unknown error'}"
+            )
+    return rows
+
+
+def _insert_parsed_log_entries(
+    conn: duckdb.DuckDBPyConnection,
+    entries,
+    source_file: str,
+    report_name: str,
+    retain_recent_hours: float | None,
+) -> int:
+    """Insert parsed entries, retaining a rolling recent window when requested."""
+    batch: list[LogEntry] = []
+    rows = 0
+    recent_entries: deque[LogEntry] = deque()
+    latest_timestamp = None
+    if retain_recent_hours is not None:
+        print(
+            f"[progress] {report_name}: {source_file}: retaining only the "
+            f"last {retain_recent_hours:g} hour(s) of timestamped records",
+            flush=True,
+        )
+    for entry in entries:
+        if retain_recent_hours is not None:
+            if entry.timestamp is None:
+                continue
+            latest_timestamp = max(latest_timestamp, entry.timestamp) if latest_timestamp else entry.timestamp
+            recent_entries.append(entry)
+            cutoff = latest_timestamp - timedelta(hours=retain_recent_hours)
+            while recent_entries and recent_entries[0].timestamp < cutoff:
+                recent_entries.popleft()
+            continue
+        batch.append(entry)
+        if len(batch) >= BATCH_SIZE:
+            rows += insert_logs(conn, batch)
+            batch.clear()
+    if retain_recent_hours is None:
+        return rows + insert_logs(conn, batch)
+    if latest_timestamp is None:
+        print(
+            f"[progress] {report_name}: {source_file}: no timestamped records; no rows retained from large file",
+            flush=True,
+        )
+        return 0
+    cutoff = latest_timestamp - timedelta(hours=retain_recent_hours)
+    batch = [entry for entry in recent_entries if entry.timestamp >= cutoff]
+    for offset in range(0, len(batch), BATCH_SIZE):
+        rows += insert_logs(conn, batch[offset : offset + BATCH_SIZE])
+    return rows
 
 
 def ingest_sos_reports(
     reports_dir: str | os.PathLike[str] | None = None,
     db_path: str | os.PathLike[str] | None = None,
     clear_existing: bool = False,
-    max_file_size_mb: int | None = 25,
-    max_workers: int | None = None,
+    max_file_size_mb: int | None = 2048,
+    force_reingest: bool = False,
+    large_log_threshold_mb: float = DEFAULT_LARGE_LOG_THRESHOLD_MB,
+    large_log_tail_hours: float = DEFAULT_LARGE_LOG_TAIL_HOURS,
 ) -> Path:
     """Ingest one or more RHOSP 17.x SOS report tar.xz archives into DuckDB."""
     root = Path(reports_dir or "SOS_REPORTS").resolve()
@@ -241,9 +390,12 @@ def ingest_sos_reports(
     db_target.parent.mkdir(parents=True, exist_ok=True)
 
     max_file_size = file_size_limit(max_file_size_mb)
-    workers = max_workers if max_workers is not None else min(4, max(1, len(archive_paths)))
+    if large_log_threshold_mb <= 0:
+        raise SosReportError("large_log_threshold_mb must be greater than zero")
+    if large_log_tail_hours <= 0:
+        raise SosReportError("large_log_tail_hours must be greater than zero")
+    large_log_threshold = int(large_log_threshold_mb * 1024 * 1024)
     total = IngestionStats()
-    seen_signatures: dict[frozenset[tuple[str, int, str]], str] = {}
 
     print(f"[progress] Found {len(archive_paths)} SOS archive(s)", flush=True)
     with duckdb.connect(str(db_target)) as conn:
@@ -251,70 +403,53 @@ def ingest_sos_reports(
         if clear_existing:
             conn.execute("DELETE FROM os_logs")
             conn.execute("DELETE FROM os_commands")
+            conn.execute("DELETE FROM ingested_reports")
 
-        if len(archive_paths) == 1 or workers <= 1:
-            for archive_index, archive_path in enumerate(archive_paths, start=1):
-                print(
-                    f"[progress] Processing archive {archive_index}/{len(archive_paths)}: "
-                    f"{archive_path.name}",
-                    flush=True,
-                )
-                stats, signature = _ingest_archive(conn, archive_path, max_file_size)
-                existing = seen_signatures.get(signature)
-                if existing is not None and signature:
-                    print(
-                        f"[skip] {archive_path.name} matches content of {existing}; "
-                        "rolling back duplicate rows.",
-                        flush=True,
-                    )
-                    _delete_report_rows(conn, archive_path.name)
-                    continue
-                if signature:
-                    seen_signatures[signature] = archive_path.name
-                total = total.add(stats)
-        else:
+        for archive_index, archive_path in enumerate(archive_paths, start=1):
             print(
-                f"[progress] Parallel ingest with up to {workers} worker(s)",
+                f"[progress] Checking duplicate registry for {archive_path.name}",
                 flush=True,
             )
-            temp_results: list[
-                tuple[Path, Path, IngestionStats, frozenset[tuple[str, int, str]]]
-            ] = []
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(_ingest_archive_to_temp, archive_path, max_file_size): archive_path
-                    for archive_path in archive_paths
-                }
-                for future in as_completed(futures):
-                    archive_path = futures[future]
-                    temp_path, stats, signature = future.result()
-                    temp_results.append((archive_path, temp_path, stats, signature))
+            archive_id = _archive_id(archive_path)
+            if not force_reingest and archive_already_ingested(conn, archive_id):
+                print(
+                    f"[skip] {archive_path.name}: already ingested "
+                    f"(archive_id={archive_id[:12]})",
+                    flush=True,
+                )
+                continue
 
-            # Merge in deterministic archive-name order for stable tests/logs.
-            temp_results.sort(key=lambda item: item[0].name)
-            for merge_index, (archive_path, temp_path, stats, signature) in enumerate(
-                temp_results, start=1
-            ):
-                try:
-                    existing = seen_signatures.get(signature)
-                    if existing is not None and signature:
-                        print(
-                            f"[skip] {archive_path.name} matches content of {existing}; "
-                            "not merging duplicate.",
-                            flush=True,
-                        )
-                        continue
-                    alias = f"tmp_archive_{merge_index}"
+            print(
+                f"[progress] Processing archive {archive_index}/{len(archive_paths)}: "
+                f"{archive_path.name}",
+                flush=True,
+            )
+            mark_archive_started(conn, archive_id, archive_path)
+            try:
+                archive_stats = _ingest_archive(
+                    conn,
+                    archive_path,
+                    max_file_size,
+                    large_log_threshold,
+                    large_log_tail_hours,
+                )
+                removed_logs, removed_commands = dedupe_ingested_rows(conn)
+                if removed_logs or removed_commands:
                     print(
-                        f"[progress] Merging {archive_path.name} into {db_target.name}",
+                        f"[dedupe] Removed {removed_logs} duplicate log row(s) and "
+                        f"{removed_commands} duplicate command row(s)",
                         flush=True,
                     )
-                    _merge_temp_db(conn, temp_path, alias)
-                    if signature:
-                        seen_signatures[signature] = archive_path.name
-                    total = total.add(stats)
-                finally:
-                    temp_path.unlink(missing_ok=True)
+                mark_archive_completed(
+                    conn,
+                    archive_id,
+                    archive_stats.log_rows,
+                    archive_stats.command_rows,
+                )
+                total = total.add(archive_stats)
+            except Exception:
+                mark_archive_failed(conn, archive_id)
+                raise
 
     print(
         "[progress] Ingestion complete: "

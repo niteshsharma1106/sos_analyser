@@ -157,12 +157,30 @@ class DetectivePhase2Tests(unittest.TestCase):
             import os
 
             old_key = os.environ.pop("OPENAI_API_KEY", None)
+            old_provider = os.environ.get("OSP_SOS_MODEL_PROVIDER")
+            old_model = os.environ.get("OSP_SOS_MODEL")
+            old_skip_dotenv = os.environ.get("OSP_SOS_SKIP_DOTENV")
+            os.environ["OSP_SOS_MODEL_PROVIDER"] = "openai"
+            os.environ["OSP_SOS_MODEL"] = "gpt-5.5"
+            os.environ["OSP_SOS_SKIP_DOTENV"] = "1"
             try:
                 with self.assertRaises(MissingLLMConfiguration):
                     investigate_prompt_with_langchain(db_path, "VM failed to create")
             finally:
                 if old_key is not None:
                     os.environ["OPENAI_API_KEY"] = old_key
+                if old_provider is not None:
+                    os.environ["OSP_SOS_MODEL_PROVIDER"] = old_provider
+                else:
+                    os.environ.pop("OSP_SOS_MODEL_PROVIDER", None)
+                if old_model is not None:
+                    os.environ["OSP_SOS_MODEL"] = old_model
+                else:
+                    os.environ.pop("OSP_SOS_MODEL", None)
+                if old_skip_dotenv is not None:
+                    os.environ["OSP_SOS_SKIP_DOTENV"] = old_skip_dotenv
+                else:
+                    os.environ.pop("OSP_SOS_SKIP_DOTENV", None)
 
 
 if __name__ == "__main__":

@@ -99,6 +99,22 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ingested_reports (
+            archive_id TEXT,
+            archive_path TEXT,
+            archive_name TEXT,
+            archive_size BIGINT,
+            archive_mtime_ns BIGINT,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            status TEXT,
+            log_rows INTEGER,
+            command_rows INTEGER
+        )
+        """
+    )
     ensure_indexes(conn)
 
 
@@ -134,6 +150,125 @@ def ensure_indexes(conn: duckdb.DuckDBPyConnection) -> None:
         ON os_commands(report_name)
         """
     )
+
+def archive_already_ingested(conn: duckdb.DuckDBPyConnection, archive_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM ingested_reports
+        WHERE archive_id = ? AND status = 'completed'
+        LIMIT 1
+        """,
+        [archive_id],
+    ).fetchone()
+    return row is not None
+
+
+def mark_archive_started(
+    conn: duckdb.DuckDBPyConnection,
+    archive_id: str,
+    archive_path: Path,
+) -> None:
+    stat = archive_path.stat()
+    conn.execute(
+        "DELETE FROM ingested_reports WHERE archive_id = ? AND status != 'completed'",
+        [archive_id],
+    )
+    conn.execute(
+        """
+        INSERT INTO ingested_reports (
+            archive_id, archive_path, archive_name, archive_size, archive_mtime_ns,
+            started_at, completed_at, status, log_rows, command_rows
+        )
+        VALUES (?, ?, ?, ?, ?, current_timestamp, NULL, 'running', 0, 0)
+        """,
+        [
+            archive_id,
+            str(archive_path.resolve()),
+            archive_path.name,
+            stat.st_size,
+            stat.st_mtime_ns,
+        ],
+    )
+
+
+def mark_archive_completed(
+    conn: duckdb.DuckDBPyConnection,
+    archive_id: str,
+    log_rows: int,
+    command_rows: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE ingested_reports
+        SET completed_at = current_timestamp,
+            status = 'completed',
+            log_rows = ?,
+            command_rows = ?
+        WHERE archive_id = ?
+        """,
+        [log_rows, command_rows, archive_id],
+    )
+
+
+def mark_archive_failed(conn: duckdb.DuckDBPyConnection, archive_id: str) -> None:
+    conn.execute(
+        """
+        UPDATE ingested_reports
+        SET completed_at = current_timestamp,
+            status = 'failed'
+        WHERE archive_id = ?
+        """,
+        [archive_id],
+    )
+
+
+def dedupe_ingested_rows(conn: duckdb.DuckDBPyConnection) -> tuple[int, int]:
+    before_logs = conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0]
+    before_commands = conn.execute("SELECT COUNT(*) FROM os_commands").fetchone()[0]
+
+    conn.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE deduped_os_logs AS
+        SELECT * EXCLUDE(row_num)
+        FROM (
+            SELECT *,
+                   row_number() OVER (
+                       PARTITION BY report_name, source_file, timestamp, pid, level,
+                                    module, message, service
+                       ORDER BY report_name
+                   ) AS row_num
+            FROM os_logs
+        )
+        WHERE row_num = 1
+        """
+    )
+    conn.execute("DELETE FROM os_logs")
+    conn.execute("INSERT INTO os_logs SELECT * FROM deduped_os_logs")
+    conn.execute("DROP TABLE deduped_os_logs")
+
+    conn.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE deduped_os_commands AS
+        SELECT * EXCLUDE(row_num)
+        FROM (
+            SELECT *,
+                   row_number() OVER (
+                       PARTITION BY report_name, source_file, command, output
+                       ORDER BY report_name
+                   ) AS row_num
+            FROM os_commands
+        )
+        WHERE row_num = 1
+        """
+    )
+    conn.execute("DELETE FROM os_commands")
+    conn.execute("INSERT INTO os_commands SELECT * FROM deduped_os_commands")
+    conn.execute("DROP TABLE deduped_os_commands")
+
+    after_logs = conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0]
+    after_commands = conn.execute("SELECT COUNT(*) FROM os_commands").fetchone()[0]
+    return int(before_logs - after_logs), int(before_commands - after_commands)
 
 
 def insert_logs(conn: duckdb.DuckDBPyConnection, entries: Sequence[LogEntry]) -> int:

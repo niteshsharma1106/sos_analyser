@@ -13,6 +13,8 @@ The current pipeline is modular and supports:
 - enriching each log and command row with RHOSP-focused metadata such as service, category, source file, report name, tags, and RHOSP version
 - loading command-oriented artifacts from SOS command captures into a second DuckDB table for system-state context
 - skipping low-value access logs during Phase 1 so ingestion stays practical on large SOS bundles
+- tracking completed archive hashes in DuckDB to avoid ingesting the same SOS archive twice
+- running row-level deduplication after each archive as a second duplicate guard
 - writing everything into a local DuckDB database with the tables os_logs and os_commands
 
 ## Quick start
@@ -83,6 +85,7 @@ python main.py analyze "VM fd27c003-5b78-4abb-a85a-aa90973f7ff0 failed to create
 - Enriches rows with RHOSP service and category metadata
 - Captures SOS command-output artifacts into os_commands
 - Uses bulk DuckDB loading for faster ingestion
+- Skips already-ingested archives through the ingested_reports registry table
 - Verifies the ingestion path with automated tests
 
 ## Phase 2 Plan: Multi-Agent Detective
