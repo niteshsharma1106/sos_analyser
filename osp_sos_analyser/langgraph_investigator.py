@@ -190,7 +190,11 @@ def _init_llm(model: str | None = None, model_provider: str | None = None):
     _validate_model_provider(resolved_model, provider)
 
     llm = init_chat_model(model=resolved_model, model_provider=provider)
-    return llm.bind(parallel_tool_calls=False)
+    # OpenAI-compatible APIs accept this; Google GenAI rejects it as an
+    # unknown GenerateContentConfig field.
+    if provider in {"openai", "groq"}:
+        return llm.bind(parallel_tool_calls=False)
+    return llm
 
 
 def build_investigation_app(

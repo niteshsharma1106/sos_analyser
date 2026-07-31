@@ -96,6 +96,77 @@ class LangGraphInvestigatorModuleTests(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+    def test_init_llm_skips_parallel_tool_calls_for_google(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        previous = {
+            key: os.environ.pop(key, None)
+            for key in (
+                "GROQ_API_KEY",
+                "GROK_API_KEY",
+                "OPENAI_API_KEY",
+                "GOOGLE_API_KEY",
+                "OSP_SOS_MODEL",
+                "OSP_SOS_MODEL_PROVIDER",
+            )
+        }
+        os.environ["OSP_SOS_SKIP_DOTENV"] = "1"
+        os.environ["GOOGLE_API_KEY"] = "test-key"
+        fake_llm = MagicMock()
+        try:
+            with patch(
+                "langchain.chat_models.init_chat_model", return_value=fake_llm
+            ) as init_mock:
+                result = _init_llm(
+                    model="gemini-2.5-flash", model_provider="google_genai"
+                )
+            init_mock.assert_called_once()
+            fake_llm.bind.assert_not_called()
+            self.assertIs(result, fake_llm)
+        finally:
+            os.environ.pop("OSP_SOS_SKIP_DOTENV", None)
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_init_llm_binds_parallel_tool_calls_for_groq(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        previous = {
+            key: os.environ.pop(key, None)
+            for key in (
+                "GROQ_API_KEY",
+                "GROK_API_KEY",
+                "OPENAI_API_KEY",
+                "GOOGLE_API_KEY",
+                "OSP_SOS_MODEL",
+                "OSP_SOS_MODEL_PROVIDER",
+            )
+        }
+        os.environ["OSP_SOS_SKIP_DOTENV"] = "1"
+        os.environ["GROQ_API_KEY"] = "test-key"
+        fake_llm = MagicMock()
+        bound = MagicMock(name="bound_llm")
+        fake_llm.bind.return_value = bound
+        try:
+            with patch(
+                "langchain.chat_models.init_chat_model", return_value=fake_llm
+            ):
+                result = _init_llm(
+                    model="gemma2-9b-it", model_provider="groq"
+                )
+            fake_llm.bind.assert_called_once_with(parallel_tool_calls=False)
+            self.assertIs(result, bound)
+        finally:
+            os.environ.pop("OSP_SOS_SKIP_DOTENV", None)
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_schema_ready_for_investigator_db(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "empty.duckdb"
