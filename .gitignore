@@ -14,3 +14,5 @@ sos_analysis.*
 .venv
 .env
 *.duckdb
+*.log
+*.wal
