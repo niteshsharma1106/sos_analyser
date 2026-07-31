@@ -43,6 +43,17 @@ class ClusterManifestAndEvidenceIndexTests(unittest.TestCase):
             infer_node_role("n1-wrkld1-b1-b13-ctrl001", "sosreport-n1-wrkld1-b1-b13-ctrl001.tar.xz"),
             "controller",
         )
+        self.assertEqual(
+            infer_node_role("n1-wrkld1-b1-b12-comp008"),
+            "compute",
+        )
+        self.assertEqual(
+            infer_node_role(
+                "n1-wrkld1-b1-b12-comp008",
+                "sosreport-n1-wrkld1-b1-b12-comp008-2026-07-27-qrkrkek.tar.xz",
+            ),
+            "compute",
+        )
 
     def test_uname_output_does_not_overwrite_hostname_with_linux(self) -> None:
         archive = "sosreport-n1-wrkld1-b1-b13-ctrl001-2026-07-27-cluluaj.tar.xz"

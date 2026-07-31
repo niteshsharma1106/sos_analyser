@@ -34,6 +34,7 @@ from .cluster_loader import (
     is_cluster_manifest_member,
     new_node_manifest,
     note_service_from_path,
+    repair_node_roles,
     resolve_cluster_id,
 )
 from .db import (
@@ -675,6 +676,13 @@ def ingest_sos_reports(
 
         log_total = int(conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0])
         cmd_total = int(conn.execute("SELECT COUNT(*) FROM os_commands").fetchone()[0])
+        repaired = repair_node_roles(conn)
+        if repaired:
+            print(
+                f"[progress] Repaired node_role for {repaired} cluster node(s) "
+                "(e.g. ...-comp008 → compute)",
+                flush=True,
+            )
         print(
             f"[progress] Post-ingest indexing over {log_total} log row(s) and "
             f"{cmd_total} command row(s) — this can take several minutes on large SOS DBs",

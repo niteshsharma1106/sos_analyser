@@ -333,6 +333,8 @@ def build_evidence_index(conn: Any, *, report_name: str | None = None) -> dict[s
     return {"entities": len(entity_rows), "mentions": mention_count}
 
 def get_cluster_manifest(conn: Any) -> list[dict[str, Any]]:
+    from .cluster_loader import infer_node_role
+
     rows = conn.execute(
         """
         SELECT cluster_id, hostname, node_role, rhosp_version, services,
@@ -341,17 +343,35 @@ def get_cluster_manifest(conn: Any) -> list[dict[str, Any]]:
         ORDER BY node_role, hostname
         """
     ).fetchall()
+    result: list[dict[str, Any]] = []
+    for cluster_id, hostname, node_role, rhosp_version, services, archive_name, archive_id in rows:
+        role = str(node_role or "unknown")
+        inferred = infer_node_role(str(hostname or ""), str(archive_name or ""))
+        if role.lower() in {"", "unknown"} and inferred != "unknown":
+            role = inferred
+        result.append(
+            {
+                "cluster_id": cluster_id,
+                "hostname": hostname,
+                "node_role": role,
+                "rhosp_version": rhosp_version,
+                "services": [part for part in str(services or "").split(",") if part],
+                "archive_name": archive_name,
+                "archive_id": archive_id,
+            }
+        )
+    return result
+
+
+def hostnames_for_node_roles(conn: Any, node_roles: Sequence[str]) -> list[str]:
+    """Resolve role filters using stored + inferred roles (works on read-only DBs)."""
+    wanted = {str(role).strip().lower() for role in node_roles if str(role).strip()}
+    if not wanted:
+        return []
     return [
-        {
-            "cluster_id": cluster_id,
-            "hostname": hostname,
-            "node_role": node_role,
-            "rhosp_version": rhosp_version,
-            "services": [part for part in str(services or "").split(",") if part],
-            "archive_name": archive_name,
-            "archive_id": archive_id,
-        }
-        for cluster_id, hostname, node_role, rhosp_version, services, archive_name, archive_id in rows
+        str(node["hostname"])
+        for node in get_cluster_manifest(conn)
+        if node.get("hostname") and str(node.get("node_role") or "").lower() in wanted
     ]
 
 
@@ -397,15 +417,13 @@ def get_evidence(
         )
         params.extend(h.lower() for h in hostnames)
     if node_roles:
+        role_hosts = hostnames_for_node_roles(conn, node_roles)
+        if not role_hosts:
+            return []
         clauses.append(
-            f"""
-            lower(hostname) IN (
-                SELECT lower(hostname) FROM cluster_nodes
-                WHERE lower(node_role) IN ({', '.join('?' for _ in node_roles)})
-            )
-            """
+            f"lower(hostname) IN ({', '.join('?' for _ in role_hosts)})"
         )
-        params.extend(role.lower() for role in node_roles)
+        params.extend(h.lower() for h in role_hosts)
     params.append(limit)
     rows = conn.execute(
         f"""
@@ -525,18 +543,60 @@ def compare_node_activity(
         """,
         params,
     ).fetchall()
-    return [
-        {
-            "hostname": str(row[0] or ""),
-            "node_role": str(row[1] or ""),
-            "service": str(row[2] or ""),
-            "level": str(row[3] or ""),
-            "event_count": int(row[4] or 0),
-            "first_seen": row[5],
-            "last_seen": row[6],
-        }
-        for row in rows
-    ]
+    from .cluster_loader import infer_node_role
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        hostname = str(row[0] or "")
+        role = str(row[1] or "")
+        if role.lower() in {"", "unknown"}:
+            role = infer_node_role(hostname)
+        out.append(
+            {
+                "hostname": hostname,
+                "node_role": role,
+                "service": str(row[2] or ""),
+                "level": str(row[3] or ""),
+                "event_count": int(row[4] or 0),
+                "first_seen": row[5],
+                "last_seen": row[6],
+            }
+        )
+    return out
+
+
+def parse_search_terms(search_terms: str | Sequence[str]) -> tuple[list[str], bool]:
+    """
+    Parse agent search text into terms.
+
+    Returns (terms, or_mode). When the agent writes ``reboot OR kernel OR panic``,
+    terms are alternatives (OR). Plain whitespace-separated terms stay AND.
+    """
+    if isinstance(search_terms, (list, tuple)):
+        raw = " ".join(str(t) for t in search_terms)
+    else:
+        raw = str(search_terms or "")
+    raw = raw.strip()
+    if not raw:
+        return [], False
+    or_mode = bool(re.search(r"\bOR\b|\|", raw, flags=re.I))
+    if or_mode:
+        parts = re.split(r"\s+OR\s+|\s*\|\s*|,", raw, flags=re.I)
+    else:
+        parts = raw.split()
+    skip = {"AND", "OR", "NOT", "THE", "A", "AN"}
+    terms: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        token = part.strip().strip("\"'()[]")
+        if not token or token.upper() in skip:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        terms.append(token)
+    return terms, or_mode
 
 
 def search_logs_by_node(
@@ -545,9 +605,10 @@ def search_logs_by_node(
     hostnames: Sequence[str] = (),
     node_roles: Sequence[str] = (),
     services: Sequence[str] = (),
-    search_terms: Sequence[str] = (),
+    search_terms: Sequence[str] | str = (),
     resource_id: str = "",
     limit: int = 30,
+    term_or: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Raw log search with optional host/role scope for multi-node investigations."""
     clauses: list[str] = []
@@ -558,25 +619,38 @@ def search_logs_by_node(
         )
         params.extend(h.lower() for h in hostnames)
     if node_roles:
+        role_hosts = hostnames_for_node_roles(conn, node_roles)
+        if not role_hosts:
+            return []
         clauses.append(
-            f"""
-            lower(COALESCE(hostname, '')) IN (
-                SELECT lower(hostname) FROM cluster_nodes
-                WHERE lower(node_role) IN ({', '.join('?' for _ in node_roles)})
-            )
-            """
+            f"lower(COALESCE(hostname, '')) IN ({', '.join('?' for _ in role_hosts)})"
         )
-        params.extend(role.lower() for role in node_roles)
+        params.extend(h.lower() for h in role_hosts)
     if services:
         clauses.append(f"service IN ({', '.join('?' for _ in services)})")
         params.extend(services)
     if resource_id:
         clauses.append("message ILIKE ?")
         params.append(f"%{resource_id}%")
-    for term in search_terms:
-        if term.strip():
-            clauses.append("message ILIKE ?")
-            params.append(f"%{term.strip()}%")
+
+    if isinstance(search_terms, str):
+        terms, detected_or = parse_search_terms(search_terms)
+    else:
+        # Already a sequence: treat as AND unless caller sets term_or / embeds OR text.
+        joined = " ".join(str(t) for t in search_terms)
+        if re.search(r"\bOR\b|\|", joined, flags=re.I):
+            terms, detected_or = parse_search_terms(joined)
+        else:
+            terms = [str(t).strip() for t in search_terms if str(t).strip()]
+            detected_or = False
+    use_or = detected_or if term_or is None else bool(term_or)
+    if terms:
+        term_sql = " OR ".join("message ILIKE ?" for _ in terms) if use_or else " AND ".join(
+            "message ILIKE ?" for _ in terms
+        )
+        clauses.append(f"({term_sql})")
+        params.extend(f"%{term}%" for term in terms)
+
     where = " AND ".join(clauses) if clauses else "1=1"
     params.append(limit)
     rows = conn.execute(
@@ -605,6 +679,63 @@ def search_logs_by_node(
             "message": str(row[5] or ""),
             "source_file": str(row[6] or ""),
             "report_name": str(row[7] or ""),
+        }
+        for row in rows
+    ]
+
+
+def search_commands_by_node(
+    conn: Any,
+    *,
+    hostnames: Sequence[str] = (),
+    command_patterns: Sequence[str] = (),
+    search_terms: Sequence[str] | str = (),
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Search sos_commands artifacts (dmesg, last, journalctl, uptime, ...)."""
+    clauses: list[str] = []
+    params: list[object] = []
+    if hostnames:
+        clauses.append(
+            f"lower(COALESCE(hostname, '')) IN ({', '.join('?' for _ in hostnames)})"
+        )
+        params.extend(h.lower() for h in hostnames)
+    if command_patterns:
+        pattern_sql = " OR ".join(
+            "(command ILIKE ? OR source_file ILIKE ?)" for _ in command_patterns
+        )
+        clauses.append(f"({pattern_sql})")
+        for pattern in command_patterns:
+            like = f"%{pattern}%"
+            params.extend([like, like])
+    terms, use_or = parse_search_terms(search_terms)
+    if terms:
+        term_sql = " OR ".join("output ILIKE ?" for _ in terms) if use_or else " AND ".join(
+            "output ILIKE ?" for _ in terms
+        )
+        clauses.append(f"({term_sql})")
+        params.extend(f"%{term}%" for term in terms)
+    where = " AND ".join(clauses) if clauses else "1=1"
+    params.append(limit)
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(hostname, ''), COALESCE(command, ''), COALESCE(source_file, ''),
+               COALESCE(service, ''), COALESCE(output, ''), COALESCE(report_name, '')
+        FROM os_commands
+        WHERE {where}
+        ORDER BY source_file
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [
+        {
+            "hostname": str(row[0] or ""),
+            "command": str(row[1] or ""),
+            "source_file": str(row[2] or ""),
+            "service": str(row[3] or ""),
+            "output": str(row[4] or ""),
+            "report_name": str(row[5] or ""),
         }
         for row in rows
     ]

@@ -30,7 +30,7 @@ CRITICAL RULES (follow exactly):
 - Keep EVERY string SHORT. summary ≤ 160 chars. intent ≤ 80 chars.
 - `entities.node_role` MUST be exactly one of: controller | compute | storage | unknown
   NEVER put keywords, log phrases, or hyphenated dumps into node_role.
-- `entities.hostname` is a short hostname only (e.g. "comp008"), ≤ 64 chars, or null.
+- `entities.hostname` is the node hostname from the incident (full name preferred), ≤ 64 chars, or null.
 - `entities.service` may be: nova, cinder, neutron, glance, keystone, heat, octavia, ironic, system, or unknown.
 - Use `system` for host reboots, kernel, hardware, or OS-level symptoms.
 - `keywords`: 3–12 short lowercase tokens (hostnames, UUIDs, error words). Each ≤ 48 chars.
@@ -47,7 +47,11 @@ _UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
 _HOSTNAME_RE = re.compile(
-    r"\b((?:ctrl|comp|compute|controller|ceph|storage|wrkld|node)[\w.-]*\d[\w.-]*)\b",
+    r"\b("
+    r"[A-Za-z0-9][A-Za-z0-9._-]{3,60}?(?:comp|ctrl|ceph|compute|controller)\d+[A-Za-z0-9._-]*"
+    r"|"
+    r"(?:ctrl|comp|compute|controller|ceph|storage|wrkld|node)[\w.-]*\d[\w.-]*"
+    r")\b",
     re.IGNORECASE,
 )
 _SHORT_HOSTNAME_RE = re.compile(r"\b([a-z][a-z0-9-]{1,30}\d{2,})\b", re.IGNORECASE)
@@ -60,12 +64,19 @@ Investigation order (mandatory):
 2) If multiple nodes are present, call compare_nodes to see which hosts are noisy.
 3) If you have a UUID/req-id/hostname, call get_entity_evidence first.
    Use hostname= or node_role= filters when the incident is node-specific.
-4) Call get_related_entities and get_operation_path to map
+   Short names like comp008 resolve to full hostnames automatically.
+4) For host reboot / crash / panic / power questions (CRITICAL):
+   a) Call search_sos_commands with hostname= and command_pattern='dmesg,last,journalctl,uptime'
+      (look for panic, MCE, watchdog, oom, shutdown).
+   b) Call search_os_logs with hostname= and search_terms using OR, e.g.
+      'reboot OR panic OR watchdog OR oom-kill OR Hardware Error'.
+   Do not conclude "no evidence" until sos_commands were checked.
+5) Call get_related_entities and get_operation_path to map
    VM ↔ port ↔ chassis ↔ host (and volume ↔ instance when relevant).
-5) Extract related IDs from digests and query those with get_entity_evidence
+6) Extract related IDs from digests and query those with get_entity_evidence
    (ports/networks -> neutron/ovn, volumes/images -> cinder/glance, instances -> nova).
-6) Use list_indexed_entities if you need candidates by type.
-7) Use search_os_logs only as a fallback when the evidence/graph index has no hits.
+7) Use list_indexed_entities if you need candidates by type.
+8) Use search_os_logs only as a fallback when the evidence/graph index has no hits.
    Prefer scoping with hostname= or node_role= (controller vs compute).
 
 Tool results are already digests. Do not paste them back in full.
@@ -143,7 +154,7 @@ class InvestigationEntities(BaseModel):
     cluster: Optional[str] = Field(default=None, max_length=64)
     hostname: Optional[str] = Field(
         default=None,
-        description="Short hostname only, e.g. comp008",
+        description="Hostname from the incident (prefer full name, e.g. n1-wrkld1-b1-b12-comp008)",
         max_length=64,
     )
     node_role: Optional[str] = Field(

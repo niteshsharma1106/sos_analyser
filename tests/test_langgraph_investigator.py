@@ -208,9 +208,9 @@ class ExpandedQueryHardeningTests(unittest.TestCase):
 
     def test_fallback_expanded_query_for_compute_reboot(self) -> None:
         plan = fallback_expanded_query(
-            "compute node comp008 auto-rebooted unexpectedly; analyze root cause"
+            "why compute n1-wrkld1-b1-b12-comp008 rebooted unexpectedly"
         )
-        self.assertEqual(plan.entities.hostname, "comp008")
+        self.assertEqual(plan.entities.hostname, "n1-wrkld1-b1-b12-comp008")
         self.assertEqual(plan.entities.node_role, "compute")
         self.assertEqual(plan.entities.service, "system")
         self.assertIn("reboot", plan.keywords)

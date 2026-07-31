@@ -6,6 +6,7 @@ import re
 import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .archive_reader import normalized_member_name, read_text_member
 
@@ -17,10 +18,16 @@ SOSREPORT_HOST_RE = re.compile(
     re.I,
 )
 ROLE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("controller", ("controller", "ctrlplane", "undercloud", "ctrl")),
+    ("controller", ("controller", "ctrlplane", "undercloud")),
     ("compute", ("compute", "novacompute")),
     ("storage", ("storage", "ceph", "cinder")),
     ("networker", ("networker", "network")),
+)
+# Compact RHOSP lab names: ...-ctrl001, ...-comp008 (not matched by "compute").
+ROLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("controller", re.compile(r"(?:^|[-_.])ctrl\d", re.I)),
+    ("compute", re.compile(r"(?:^|[-_.])comp\d", re.I)),
+    ("storage", re.compile(r"(?:^|[-_.])(?:ceph|storage)\d", re.I)),
 )
 # First token of `uname -a` / junk hostname files must never become the node id.
 INVALID_HOSTNAMES = frozenset(
@@ -83,10 +90,52 @@ def guess_hostname_from_archive_name(archive_name: str) -> str:
 
 def infer_node_role(hostname: str, archive_name: str = "") -> str:
     haystack = f"{hostname} {archive_name}".lower()
+    for role, pattern in ROLE_PATTERNS:
+        if pattern.search(haystack):
+            return role
     for role, tokens in ROLE_RULES:
         if any(token in haystack for token in tokens):
             return role
+    # Legacy short token: bare "ctrl" still common in older names.
+    if re.search(r"(?:^|[-_.])ctrl(?:$|[-_.])", haystack):
+        return "controller"
     return "unknown"
+
+
+def repair_node_roles(conn: Any) -> int:
+    """Fix cluster_nodes/os_* roles when hostname implies compute/controller."""
+    try:
+        rows = conn.execute(
+            "SELECT hostname, node_role, archive_name FROM cluster_nodes"
+        ).fetchall()
+    except Exception:
+        return 0
+    updated = 0
+    for hostname, role, archive_name in rows:
+        host = str(hostname or "").strip()
+        if not host:
+            continue
+        inferred = infer_node_role(host, str(archive_name or ""))
+        current = str(role or "unknown").strip().lower() or "unknown"
+        if inferred == "unknown" or inferred == current:
+            continue
+        conn.execute(
+            "UPDATE cluster_nodes SET node_role = ? WHERE hostname = ?",
+            [inferred, host],
+        )
+        try:
+            conn.execute(
+                "UPDATE os_logs SET node_role = ? WHERE lower(hostname) = lower(?)",
+                [inferred, host],
+            )
+            conn.execute(
+                "UPDATE os_commands SET node_role = ? WHERE lower(hostname) = lower(?)",
+                [inferred, host],
+            )
+        except Exception:
+            pass
+        updated += 1
+    return updated
 
 
 def is_cluster_manifest_member(member: tarfile.TarInfo, max_file_size: int) -> bool:

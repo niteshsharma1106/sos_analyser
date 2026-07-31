@@ -152,3 +152,99 @@ class InvestigationToolsTests(unittest.TestCase):
 
                 self.assertIn("get_related_entities", tools)
                 self.assertIn("get_operation_path", tools)
+                self.assertIn("search_sos_commands", tools)
+
+    def test_reboot_investigation_helpers_resolve_comp_host(self) -> None:
+        from osp_sos_analyser.db import ensure_schema
+        from osp_sos_analyser.evidence_index import parse_search_terms
+        from osp_sos_analyser.investigation_tools import (
+            hostnames_mentioned_in_text,
+            resolve_hostnames,
+        )
+
+        terms, or_mode = parse_search_terms("reboot OR kernel OR crash OR power")
+        self.assertTrue(or_mode)
+        self.assertEqual(terms, ["reboot", "kernel", "crash", "power"])
+        self.assertNotIn("OR", terms)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "cluster.duckdb"
+            host = "n1-wrkld1-b1-b12-comp008"
+            with duckdb.connect(str(db_path)) as conn:
+                ensure_schema(conn)
+                conn.execute(
+                    """
+                    INSERT INTO cluster_nodes (
+                        cluster_id, hostname, node_role, rhosp_version, services,
+                        archive_name, archive_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        "abc",
+                        host,
+                        "unknown",
+                        "17.x",
+                        "nova,ovn",
+                        "sosreport-n1-wrkld1-b1-b12-comp008-2026-07-27-qrkrkek.tar.xz",
+                        "id1",
+                    ],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO os_logs (
+                        timestamp, level, service, message, source_file,
+                        report_name, hostname, node_role
+                    ) VALUES (now(), 'ERROR', 'system', 'kernel panic - not syncing',
+                              'var/log/messages', 'sos', ?, 'unknown')
+                    """,
+                    [host],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO os_commands (
+                        source, command, output, service, category, source_file,
+                        report_name, hostname, node_role
+                    ) VALUES ('sos', 'dmesg', 'Kernel panic - not syncing: Fatal',
+                              'system', 'kernel', 'sos_commands/kernel/dmesg',
+                              'sos', ?, 'unknown')
+                    """,
+                    [host],
+                )
+
+                # Overlay should report compute even though DB says unknown.
+                self.assertIn("role=compute", format_manifest(conn))
+                self.assertEqual(resolve_hostnames(conn, "comp008"), [host])
+                self.assertEqual(
+                    hostnames_mentioned_in_text(
+                        conn, "why compute n1-wrkld1-b1-b12-comp008 rebooted?"
+                    ),
+                    [host],
+                )
+
+                digest = prefetch_investigation_digest(
+                    conn,
+                    raw_query="why compute n1-wrkld1-b1-b12-comp008 rebooted?",
+                    keywords=["reboot", "comp008"],
+                )
+                self.assertIn("Focused host evidence", digest)
+                self.assertIn("kernel panic", digest.lower())
+                self.assertIn("dmesg", digest.lower())
+
+                tools = {tool.name: tool for tool in build_langchain_tools(conn)}
+                logs = tools["search_os_logs"].invoke(
+                    {
+                        "hostname": "comp008",
+                        "search_terms": "reboot OR panic OR watchdog",
+                        "limit": 10,
+                    }
+                )
+                self.assertIn("panic", logs.lower())
+                cmds = tools["search_sos_commands"].invoke(
+                    {
+                        "hostname": "comp008",
+                        "command_pattern": "dmesg",
+                        "search_terms": "panic OR Fatal",
+                        "limit": 5,
+                    }
+                )
+                self.assertIn("Kernel panic", cmds)

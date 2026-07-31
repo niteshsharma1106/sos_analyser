@@ -1,6 +1,7 @@
 # investigation_tools.py — agent-facing wrappers over Cluster Manifest + Evidence Index.
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -14,6 +15,8 @@ from .evidence_index import (
     get_evidence,
     get_host_activity,
     list_entities,
+    parse_search_terms,
+    search_commands_by_node,
     search_logs_by_node,
 )
 from .relationship_graph import (
@@ -21,6 +24,34 @@ from .relationship_graph import (
     format_relationships,
     get_operation_path as fetch_operation_path,
     get_related_entities as fetch_related_entities,
+)
+
+REBOOT_LOG_TERMS = (
+    "reboot",
+    "shutdown",
+    "power off",
+    "kernel panic",
+    "Oops:",
+    "BUG:",
+    "watchdog",
+    "MCE",
+    "Hardware Error",
+    "Out of memory",
+    "oom-kill",
+    "Resetting",
+    "systemd-shutdown",
+    "Stopped target",
+    "Reached target Shutdown",
+)
+REBOOT_COMMAND_PATTERNS = (
+    "dmesg",
+    "last",
+    "who_-b",
+    "uptime",
+    "journalctl",
+    "ipmitool",
+    "mcelog",
+    "crash",
 )
 
 
@@ -49,13 +80,12 @@ def format_evidence_mentions(mentions: Sequence[EvidenceMention]) -> str:
         lines.append(
             "|".join(
                 [
-                    str(item.timestamp or ""),
+                    str(item.timestamp or "-"),
                     item.hostname or "-",
                     item.service or "-",
                     item.level or "-",
-                    item.entity_type or "-",
-                    truncate_text(item.message_excerpt, 180),
-                    item.source_file or "",
+                    item.source_file or "-",
+                    truncate_text(item.message_excerpt, 220),
                 ]
             )
         )
@@ -64,7 +94,7 @@ def format_evidence_mentions(mentions: Sequence[EvidenceMention]) -> str:
 
 def format_node_comparison(rows: Sequence[dict[str, Any]]) -> str:
     if not rows:
-        return "No per-node activity matched the filters."
+        return "No cross-node activity matched."
     lines = ["hostname|role|service|level|count|first_seen|last_seen"]
     for row in rows:
         lines.append(
@@ -75,8 +105,8 @@ def format_node_comparison(rows: Sequence[dict[str, Any]]) -> str:
                     str(row.get("service") or "-"),
                     str(row.get("level") or "-"),
                     str(row.get("event_count") or 0),
-                    str(row.get("first_seen") or ""),
-                    str(row.get("last_seen") or ""),
+                    str(row.get("first_seen") or "-"),
+                    str(row.get("last_seen") or "-"),
                 ]
             )
         )
@@ -85,65 +115,95 @@ def format_node_comparison(rows: Sequence[dict[str, Any]]) -> str:
 
 def format_node_log_rows(rows: Sequence[dict[str, Any]]) -> str:
     if not rows:
-        return "No matching logs."
+        return "No log rows matched."
     lines = []
     for row in rows:
         lines.append(
             "|".join(
                 [
-                    str(row.get("timestamp") or ""),
+                    str(row.get("timestamp") or "-"),
                     str(row.get("hostname") or "-"),
                     str(row.get("node_role") or "-"),
                     str(row.get("service") or "-"),
                     str(row.get("level") or "-"),
-                    truncate_text(str(row.get("message") or ""), 180),
-                    str(row.get("source_file") or ""),
+                    str(row.get("source_file") or "-"),
+                    truncate_text(str(row.get("message") or ""), 220),
                 ]
             )
         )
     return "\n".join(lines)
 
 
-def mentions_to_log_records(mentions: Sequence[EvidenceMention]) -> tuple[LogRecord, ...]:
-    return tuple(
-        LogRecord(
-            timestamp=item.timestamp,
-            level=item.level,
-            service=item.service or "unknown",
-            module=item.entity_type or "",
-            message=item.message_excerpt,
-            source_file=item.source_file,
-            report_name=item.report_name,
-            hostname=item.hostname or "",
+def format_command_rows(rows: Sequence[dict[str, Any]]) -> str:
+    if not rows:
+        return "No sos_commands artifacts matched."
+    blocks: list[str] = []
+    for row in rows:
+        header = (
+            f"{row.get('hostname') or '-'}|{row.get('command') or '-'}|"
+            f"{row.get('source_file') or '-'}|{row.get('service') or '-'}"
         )
-        for item in mentions
-    )
+        output = truncate_text(str(row.get("output") or ""), 1200)
+        blocks.append(header + "\n" + output)
+    return "\n\n".join(blocks)
 
 
-def indexed_evidence_for_hints(
-    conn: Any,
-    hints: Any,
-    *,
-    services: Sequence[str] = (),
-    limit: int = 10,
-) -> list[LogRecord]:
-    """Prefer Evidence Index hits for identifiers; otherwise return empty."""
-    identifiers = getattr(hints, "identifiers", ()) or ()
-    hostnames = tuple(getattr(hints, "hostnames", ()) or ())
-    if not identifiers:
+def resolve_hostnames(conn: Any, hint: str) -> list[str]:
+    """Map short tokens like comp008 to full cluster hostnames."""
+    token = (hint or "").strip().lower()
+    if not token:
         return []
-    mentions: list[EvidenceMention] = []
-    for identifier in list(identifiers)[:3]:
-        mentions.extend(
-            get_evidence(
-                conn,
-                identifier,
-                services=services,
-                hostnames=hostnames,
-                limit=limit,
-            )
-        )
-    return list(mentions_to_log_records(mentions)[:limit])
+    nodes = get_cluster_manifest(conn)
+    hosts = [str(n.get("hostname") or "") for n in nodes if n.get("hostname")]
+    if not hosts:
+        return [hint.strip()]
+    exact = [h for h in hosts if h.lower() == token]
+    if exact:
+        return exact
+    # Prefer suffix / token boundary matches (…-comp008).
+    boundary = []
+    contains = []
+    for host in hosts:
+        lower = host.lower()
+        if lower.endswith(token) or re.search(
+            rf"(?:^|[-_.]){re.escape(token)}(?:$|[-_.])", lower
+        ):
+            boundary.append(host)
+        elif token in lower:
+            contains.append(host)
+    matches = boundary or contains
+    return matches or [hint.strip()]
+
+
+def hostnames_mentioned_in_text(conn: Any, text: str) -> list[str]:
+    """Find cluster hostnames (or short tokens) referenced in a question."""
+    nodes = get_cluster_manifest(conn)
+    hosts = [str(n.get("hostname") or "") for n in nodes if n.get("hostname")]
+    found: list[str] = []
+    lower = (text or "").lower()
+    for host in hosts:
+        if host.lower() in lower:
+            found.append(host)
+            continue
+        # short token: last label like comp008 / ctrl001
+        short = host.split(".")[0].split("-")[-1]
+        if len(short) >= 4 and short.lower() in lower:
+            found.append(host)
+            continue
+        # also match mid-token comp008 inside longer names when user says comp008
+        match = re.search(r"(?:^|[-_.])((?:comp|ctrl|ceph)\d+[a-z0-9]*)", host, re.I)
+        if match and match.group(1).lower() in lower:
+            found.append(host)
+    # Dedupe preserve order
+    out: list[str] = []
+    seen: set[str] = set()
+    for host in found:
+        key = host.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(host)
+    return out
 
 
 def prefetch_investigation_digest(
@@ -161,6 +221,44 @@ def prefetch_investigation_digest(
     if len(nodes) > 1:
         comparison = compare_node_activity(conn, limit=40)
         sections.append("## Cross-node activity\n" + format_node_comparison(comparison))
+
+    focus_hosts = hostnames_mentioned_in_text(conn, raw_query)
+    rebootish = bool(
+        re.search(
+            r"\b(reboot|rebooted|crash|panic|oom|shutdown|power[\s-]?off|watchdog)\b",
+            raw_query or "",
+            re.I,
+        )
+    )
+    if focus_hosts:
+        host_blocks: list[str] = []
+        for host in focus_hosts[:3]:
+            activity = get_host_activity(
+                conn,
+                host,
+                levels=("CRITICAL", "ERROR", "WARNING"),
+                limit=limit_per_entity,
+            )
+            block = f"### Host {host}\n" + format_evidence_mentions(activity)
+            if rebootish:
+                reboot_logs = search_logs_by_node(
+                    conn,
+                    hostnames=[host],
+                    search_terms=" OR ".join(REBOOT_LOG_TERMS[:10]),
+                    limit=limit_per_entity,
+                )
+                block += "\n\nReboot/crash log hits:\n" + format_node_log_rows(reboot_logs)
+                cmds = search_commands_by_node(
+                    conn,
+                    hostnames=[host],
+                    command_patterns=REBOOT_COMMAND_PATTERNS,
+                    limit=8,
+                )
+                block += "\n\nHost sos_commands (dmesg/last/journal):\n" + format_command_rows(
+                    cmds
+                )
+            host_blocks.append(block)
+        sections.append("## Focused host evidence\n" + "\n\n".join(host_blocks))
 
     ids = []
     if resource_id:
@@ -187,7 +285,7 @@ def prefetch_investigation_digest(
                 block += "\n\n" + format_operation_path(path, start_entity_id=entity_id)
             blocks.append(block)
         sections.append("## Indexed entity evidence\n" + "\n\n".join(blocks))
-    else:
+    elif not focus_hosts:
         # Surface top entities so the agent has something concrete to start from.
         top = list_entities(conn, limit=15)
         if top:
@@ -246,33 +344,51 @@ def build_langchain_tools(conn: Any):
         """
         Fetch indexed evidence for one canonical entity (instance/port/volume/network/req-/host).
         Prefer this over searching raw logs. Optional service/hostname/node_role filters.
-        For hostnames, also returns recent host activity from os_logs.
+        For hostnames (full or short like comp008), also returns recent host activity.
         """
         if not entity_id.strip():
             return "entity_id is required."
         services = [service] if service.strip() else ()
-        hostnames = [hostname] if hostname.strip() else ()
+        hostnames = resolve_hostnames(conn, hostname) if hostname.strip() else ()
         node_roles = [node_role] if node_role.strip() else ()
         capped = max(1, min(int(limit), 30))
-        entity = get_entity(conn, entity_id.strip())
+        eid = entity_id.strip()
+        resolved_hosts = resolve_hostnames(conn, eid)
+        entity = get_entity(conn, eid)
+        # Short host tokens often aren't the entity_id; resolve to full hostname entity.
+        if entity is None and resolved_hosts:
+            for host in resolved_hosts:
+                entity = get_entity(conn, host)
+                if entity:
+                    eid = host
+                    break
+            if entity is None:
+                eid = resolved_hosts[0]
+                hostnames = resolved_hosts
+
         header = (
             f"entity={entity.entity_id} type={entity.entity_type} mentions={entity.mention_count}\n"
             if entity
-            else f"entity={entity_id} (not registered in entities table)\n"
+            else f"entity={eid} (not registered in entities table)\n"
         )
         mentions = get_evidence(
             conn,
-            entity_id.strip(),
+            eid,
             limit=capped,
             services=services,
             hostnames=hostnames,
             node_roles=node_roles,
         )
         body = format_evidence_mentions(mentions)
+        host_for_activity = None
         if entity and entity.entity_type == "host":
+            host_for_activity = entity.entity_id
+        elif resolved_hosts:
+            host_for_activity = resolved_hosts[0]
+        if host_for_activity:
             host_rows = get_host_activity(
                 conn,
-                entity.entity_id,
+                host_for_activity,
                 services=services,
                 limit=capped,
             )
@@ -313,10 +429,11 @@ def build_langchain_tools(conn: Any):
         """
         Fallback raw log search with optional hostname/node_role scope.
         Prefer get_entity_evidence when you have a UUID/req-id.
-        If resource_id is set, this first returns indexed evidence for that entity.
+        Hostname may be short (comp008) or FQDN; it is resolved against cluster_nodes.
+        For alternatives use OR, e.g. 'reboot OR panic OR watchdog'.
         """
         capped = max(1, min(int(limit), 30))
-        hostnames = [hostname.strip()] if hostname.strip() else ()
+        hostnames = resolve_hostnames(conn, hostname) if hostname.strip() else ()
         node_roles = [node_role.strip()] if node_role.strip() else ()
         services = [service] if service.strip() else ()
         if resource_id.strip():
@@ -347,11 +464,45 @@ def build_langchain_tools(conn: Any):
             hostnames=hostnames,
             node_roles=node_roles,
             services=services,
-            search_terms=search_terms.split(),
+            search_terms=search_terms,
             resource_id=resource_id.strip(),
             limit=capped,
         )
-        return format_node_log_rows(rows)
+        note = ""
+        if hostname.strip() and hostnames and hostnames[0].lower() != hostname.strip().lower():
+            note = f"(resolved hostname {hostname!r} → {', '.join(hostnames)})\n"
+        return note + format_node_log_rows(rows)
+
+    @tool
+    def search_sos_commands(
+        hostname: str = "",
+        command_pattern: str = "",
+        search_terms: str = "",
+        limit: int = 10,
+    ) -> str:
+        """
+        Search sos_commands outputs (dmesg, last, journalctl, uptime, ipmitool, ...).
+        Critical for host reboot/crash RCA. Hostname may be short (comp008).
+        Examples: command_pattern='dmesg' or 'last'; search_terms='panic OR reboot OR MCE'.
+        """
+        capped = max(1, min(int(limit), 20))
+        hostnames = resolve_hostnames(conn, hostname) if hostname.strip() else ()
+        patterns = (
+            [p.strip() for p in re.split(r"[,\s]+", command_pattern) if p.strip()]
+            if command_pattern.strip()
+            else list(REBOOT_COMMAND_PATTERNS)
+        )
+        rows = search_commands_by_node(
+            conn,
+            hostnames=hostnames,
+            command_patterns=patterns,
+            search_terms=search_terms,
+            limit=capped,
+        )
+        note = ""
+        if hostname.strip() and hostnames and hostnames[0].lower() != hostname.strip().lower():
+            note = f"(resolved hostname {hostname!r} → {', '.join(hostnames)})\n"
+        return note + format_command_rows(rows)
 
     @tool
     def get_related_entities(
@@ -367,9 +518,14 @@ def build_langchain_tools(conn: Any):
         if not entity_id.strip():
             return "entity_id is required."
         types = [relation_type.strip()] if relation_type.strip() else ()
+        eid = entity_id.strip()
+        if get_entity(conn, eid) is None:
+            resolved = resolve_hostnames(conn, eid)
+            if resolved:
+                eid = resolved[0]
         rows = fetch_related_entities(
             conn,
-            entity_id.strip(),
+            eid,
             relation_types=types,
             limit=max(1, min(int(limit), 50)),
         )
@@ -389,14 +545,19 @@ def build_langchain_tools(conn: Any):
         """
         if not start_entity_id.strip():
             return "start_entity_id is required."
+        start = start_entity_id.strip()
+        if get_entity(conn, start) is None:
+            resolved = resolve_hostnames(conn, start)
+            if resolved:
+                start = resolved[0]
         path = fetch_operation_path(
             conn,
-            start_entity_id.strip(),
+            start,
             target_entity_id=target_entity_id.strip(),
             target_type=target_type.strip(),
             max_hops=max(1, min(int(max_hops), 6)),
         )
-        return format_operation_path(path, start_entity_id=start_entity_id.strip())
+        return format_operation_path(path, start_entity_id=start)
 
     return [
         get_cluster_overview,
@@ -406,4 +567,5 @@ def build_langchain_tools(conn: Any):
         get_operation_path,
         list_indexed_entities,
         search_os_logs,
+        search_sos_commands,
     ]
