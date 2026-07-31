@@ -14,7 +14,13 @@ from .langgraph_investigator import (
     render_investigation_result,
 )
 from .llm_client import MissingLLMConfiguration
-from .relationship_graph import get_operation_path, get_related_entities, format_operation_path, format_relationships
+from .observability import configure_logging, get_logger
+from .relationship_graph import (
+    format_operation_path,
+    format_relationships,
+    get_operation_path,
+    get_related_entities,
+)
 
 
 DEFAULT_DB_PATH = "sos_analysis.duckdb"
@@ -69,7 +75,9 @@ def _answer_question(
     focus_entity: str = "",
     include_graph: bool = True,
     answer_style: str = "Concise RCA",
+    show_observability: bool = True,
 ) -> str:
+    log = get_logger("chat")
     prompt = (message or "").strip()
     if not prompt:
         return "Ask an OpenStack / SOS investigation question to begin."
@@ -84,6 +92,14 @@ def _answer_question(
 
     banner = _cluster_banner(db)
     prefix = f"{banner}\n\n" if banner else ""
+    log.info(
+        "Chat question offline=%s graph=%s style=%s focus=%s prompt=%s",
+        offline,
+        include_graph,
+        answer_style,
+        focus_entity or "-",
+        prompt[:160],
+    )
 
     try:
         if offline:
@@ -103,13 +119,18 @@ def _answer_question(
             answer_style=answer_style,
             include_graph=include_graph,
         )
-        return prefix + render_investigation_result(result)
+        return prefix + render_investigation_result(
+            result,
+            include_observability=show_observability,
+        )
     except MissingLLMConfiguration as exc:
+        log.warning("Missing LLM configuration: %s", exc)
         return (
             f"{exc}\n\n"
             "Set your API key in `.env`, or enable **Offline mode** in the sidebar."
         )
     except Exception as exc:  # noqa: BLE001 - surface runtime errors in the chat UI
+        log.exception("Chat investigation failed")
         return f"Investigation failed: `{type(exc).__name__}: {exc}`"
 
 
@@ -130,6 +151,7 @@ def build_chat_app(
         focus_entity: str,
         include_graph: bool,
         answer_style: str,
+        show_observability: bool,
     ):
         return _answer_question(
             message,
@@ -140,6 +162,7 @@ def build_chat_app(
             focus_entity,
             include_graph,
             answer_style,
+            show_observability,
         )
 
     model_value = default_model or os.getenv("OSP_SOS_MODEL", "")
@@ -148,13 +171,23 @@ def build_chat_app(
         banner = _cluster_banner(default_db_path)
     description = (
         "Ask a question about your ingested RHOSP SOS reports. "
-        "Uses Cluster Manifest, Evidence Index, and VM↔port↔chassis↔host graph."
+        "Uses Cluster Manifest, Evidence Index, and VM↔port↔chassis↔host graph. "
+        "Backend agent steps are logged and can be shown under each answer."
     )
     if banner:
         description = f"{banner}\n\n{description}"
 
     examples = [
-        [prompt, default_db_path, default_offline, model_value, "", True, "Concise RCA"]
+        [
+            prompt,
+            default_db_path,
+            default_offline,
+            model_value,
+            "",
+            True,
+            "Concise RCA",
+            True,
+        ]
         for prompt in DEFAULT_EXAMPLES
     ]
 
@@ -194,6 +227,11 @@ def build_chat_app(
                 value="Concise RCA",
                 label="Answer style",
             ),
+            gr.Checkbox(
+                value=True,
+                label="Show agent observability",
+                info="Include node/tool/LLM timeline under the answer",
+            ),
         ],
         additional_inputs_accordion=gr.Accordion(label="Investigation settings", open=True),
         fill_height=True,
@@ -211,8 +249,19 @@ def launch_chat(
     host: str = "127.0.0.1",
     port: int = 7860,
     share: bool = False,
+    log_level: str | None = None,
+    log_file: str | None = None,
 ) -> None:
     import gradio as gr
+
+    configure_logging(level=log_level, log_file=log_file)
+    get_logger("chat").info(
+        "Launching chat UI db=%s host=%s port=%s offline=%s",
+        db_path,
+        host,
+        port,
+        offline,
+    )
 
     app = build_chat_app(
         default_db_path=db_path,
@@ -243,6 +292,16 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Create a temporary public Gradio share link",
     )
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("OSP_SOS_LOG_LEVEL", "INFO"),
+        help="Backend log level (DEBUG, INFO, WARNING, ERROR)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=os.getenv("OSP_SOS_LOG_FILE"),
+        help="Optional log file path (also set OSP_SOS_LOG_FILE)",
+    )
     args = parser.parse_args(argv)
     launch_chat(
         db_path=args.db_path,
@@ -251,6 +310,8 @@ def main(argv: list[str] | None = None) -> None:
         host=args.host,
         port=args.port,
         share=args.share,
+        log_level=args.log_level,
+        log_file=args.log_file,
     )
 
 

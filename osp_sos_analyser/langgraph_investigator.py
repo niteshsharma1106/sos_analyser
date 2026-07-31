@@ -10,6 +10,12 @@ from pydantic import BaseModel, Field
 from .context_pack import truncate_text
 from .investigation_tools import build_langchain_tools, prefetch_investigation_digest
 from .llm_client import MissingLLMConfiguration
+from .observability import (
+    AgentObservabilityCallback,
+    AgentRunTrace,
+    configure_logging,
+    get_logger,
+)
 
 
 EXPAND_SYSTEM_PROMPT = """You are a query enrichment agent for a Red Hat OpenStack investigation workflow.
@@ -106,6 +112,8 @@ class InvestigationState(TypedDict, total=False):
     findings: Dict[str, Any]
     final_rca: Optional[str]
     next_node: str
+    agent_trace: Optional[Dict[str, Any]]
+    run_id: str
 
 
 def _normalize_provider(model_provider: str) -> str:
@@ -216,15 +224,18 @@ def build_investigation_app(
     model: str | None = None,
     model_provider: str | None = None,
     llm=None,
+    trace: AgentRunTrace | None = None,
 ):
     """Compile the expand → investigate → synthesize LangGraph app."""
     from langchain.agents import create_agent
     from langchain.agents.middleware import SummarizationMiddleware
     from langchain_core.messages import AIMessage, ToolMessage
     from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.runnables import RunnablePassthrough
+    from langchain_core.runnables import RunnableConfig, RunnablePassthrough
     from langgraph.graph import END, START, StateGraph
 
+    log = get_logger("investigator")
+    run_trace = trace or AgentRunTrace()
     llm = llm or _init_llm(model=model, model_provider=model_provider)
     tools = build_langchain_tools(db_con)
 
@@ -248,13 +259,30 @@ def build_investigation_app(
     )
 
     def expand_query_node(state: InvestigationState) -> dict:
-        print("--- NODE: Expanding Query ---")
-        print(f"[QUERY] raw input: {state['raw_query']}")
+        run_trace.node_start("QUERY_EXPAND")
+        log.info("Expanding query for run %s", run_trace.run_id[:8])
         structured_llm = llm.with_structured_output(ExpandedQuery, method="json_schema")
         enrichment_chain = {"query": RunnablePassthrough()} | prompt_expand | structured_llm
-        print("[QUERY] sending prompt to LLM...")
-        result = enrichment_chain.invoke(state["raw_query"])
-        print(f"[QUERY] result: {result}")
+        expand_cb = AgentObservabilityCallback(run_trace, stage="query_expand")
+        run_trace.llm_start("query_expand")
+        result = enrichment_chain.invoke(
+            state["raw_query"],
+            config=RunnableConfig(callbacks=[expand_cb.handler]),
+        )
+        run_trace.llm_end(
+            "query_expand",
+            intent=getattr(result, "intent", None),
+            resource_id=getattr(getattr(result, "entities", None), "resource_id", None),
+        )
+        run_trace.add(
+            "plan",
+            "Expanded investigation plan",
+            details={
+                "summary": getattr(result, "summary", ""),
+                "intent": getattr(result, "intent", ""),
+                "keywords": list(getattr(result, "keywords", []) or [])[:8],
+            },
+        )
 
         resource_id = None
         if result.entities and result.entities.resource_id:
@@ -266,10 +294,20 @@ def build_investigation_app(
             keywords=list(result.keywords or [])[:8],
             limit_per_entity=12,
         )
-        print(f"[PREFETCH]\n{digest[:800]}")
-        return {"expanded_plan": result, "prefetch_digest": digest}
+        run_trace.add(
+            "prefetch",
+            "Built cluster/evidence prefetch digest",
+            details={"chars": len(digest), "preview": truncate_text(digest, 240)},
+        )
+        run_trace.node_end("QUERY_EXPAND")
+        return {
+            "expanded_plan": result,
+            "prefetch_digest": digest,
+            "run_id": run_trace.run_id,
+        }
 
     def investigator_node(state: InvestigationState) -> dict:
+        run_trace.node_start("INVESTIGATOR")
         plan = state["expanded_plan"]
         prefetch = state.get("prefetch_digest") or "No prefetched evidence."
         user_message = (
@@ -280,7 +318,11 @@ def build_investigation_app(
             f"Time window: {plan.time_window}\n\n"
             f"Prefetched digest (already retrieved — build on it):\n{prefetch}\n"
         )
-        result = investigator_agent.invoke({"messages": [("user", user_message)]})
+        agent_cb = AgentObservabilityCallback(run_trace, stage="investigator")
+        result = investigator_agent.invoke(
+            {"messages": [("user", user_message)]},
+            config=RunnableConfig(callbacks=[agent_cb.handler]),
+        )
         messages = result["messages"]
 
         call_args: dict[str, dict[str, Any]] = {}
@@ -293,21 +335,37 @@ def build_investigation_app(
         for message in messages:
             if isinstance(message, ToolMessage):
                 args = call_args.get(message.tool_call_id, {})
+                tool_name = message.name or "tool"
+                output = str(message.content)
+                # Callbacks usually record tool events; keep a digest fallback.
+                if not any(
+                    event.kind == "tool_end" and tool_name in event.message
+                    for event in run_trace.events
+                ):
+                    run_trace.tool_start(tool_name, args)
+                    run_trace.tool_end(tool_name, output)
                 gathered_evidence.append(
                     {
                         "service": args.get("service") or args.get("entity_type") or "index",
-                        "source": message.name or "tool",
+                        "source": tool_name,
                         "summary": str(args),
-                        "raw_logs": truncate_text(str(message.content), 1200),
+                        "raw_logs": truncate_text(output, 1200),
                     }
                 )
 
+        run_trace.add(
+            "investigator_summary",
+            "Investigator finished tool loop",
+            details={"tool_results": len(gathered_evidence)},
+        )
+        run_trace.node_end("INVESTIGATOR", tools=len(gathered_evidence))
         return {
             "gathered_evidence": gathered_evidence,
             "findings": {"investigator_raw": messages[-1].content},
         }
 
     def synthesize_rca(state: InvestigationState) -> dict:
+        run_trace.node_start("SYNTHESIZE_RCA")
         plan = state["expanded_plan"]
         evidence = state.get("gathered_evidence", [])
         investigator_notes = state.get("findings", {}).get("investigator_raw", "")
@@ -329,9 +387,22 @@ def build_investigation_app(
     Write a concise root cause analysis. Cite hostnames and entity IDs when possible.
     If evidence is weak, say so and recommend next checks.
     """
-        result = llm.invoke(rca_prompt)
+        synth_cb = AgentObservabilityCallback(run_trace, stage="synthesize")
+        result = llm.invoke(
+            rca_prompt,
+            config=RunnableConfig(callbacks=[synth_cb.handler]),
+        )
         content = getattr(result, "content", result)
-        return {"final_rca": content}
+        run_trace.add(
+            "rca",
+            "Synthesized root cause analysis",
+            details={"chars": len(str(content))},
+        )
+        run_trace.node_end("SYNTHESIZE_RCA")
+        return {
+            "final_rca": content,
+            "agent_trace": run_trace.to_dict(),
+        }
 
     workflow = StateGraph(InvestigationState)
     workflow.add_node("QUERY_EXPAND", expand_query_node)
@@ -354,11 +425,15 @@ def investigate_with_langgraph(
     focus_entity: str | None = None,
     answer_style: str = "Concise RCA",
     include_graph: bool = True,
+    trace: AgentRunTrace | None = None,
 ) -> dict[str, Any]:
     """Run the notebook RCA workflow from a Python entrypoint."""
     from langchain_core.utils.uuid import uuid7
 
     from .dbconnector import DatabaseConnector
+
+    configure_logging()
+    log = get_logger("investigator")
 
     enriched = (prompt or "").strip()
     extras: list[str] = []
@@ -381,31 +456,60 @@ def investigate_with_langgraph(
     if extras:
         enriched = enriched + "\n\n" + "\n".join(extras)
 
-    with DatabaseConnector(db_path, read_only=True) as db:
-        app = build_investigation_app(
-            db.connect(),
-            model=model,
-            model_provider=model_provider,
-        )
-        initial_state: InvestigationState = {
-            "raw_query": enriched,
-            "expanded_plan": None,
-            "prefetch_digest": "",
-            "gathered_evidence": [],
-            "findings": {},
-            "final_rca": "",
-            "next_node": "",
-        }
-        config = {
-            "run_id": uuid7(),
-            "recursion_limit": recursion_limit,
-        }
-        return app.invoke(initial_state, config=config)
+    run_trace = trace or AgentRunTrace(prompt=enriched)
+    run_trace.add("run_start", "Starting LangGraph investigation", details={"db_path": str(db_path)})
+    log.info("Investigation start run=%s prompt=%s", run_trace.run_id[:8], truncate_text(prompt, 120))
+
+    try:
+        with DatabaseConnector(db_path, read_only=True) as db:
+            app = build_investigation_app(
+                db.connect(),
+                model=model,
+                model_provider=model_provider,
+                trace=run_trace,
+            )
+            initial_state: InvestigationState = {
+                "raw_query": enriched,
+                "expanded_plan": None,
+                "prefetch_digest": "",
+                "gathered_evidence": [],
+                "findings": {},
+                "final_rca": "",
+                "next_node": "",
+                "run_id": run_trace.run_id,
+            }
+            config = {
+                "run_id": uuid7(),
+                "recursion_limit": recursion_limit,
+            }
+            final_state = app.invoke(initial_state, config=config)
+    except Exception as exc:
+        run_trace.error(f"Investigation failed: {exc}")
+        raise
+
+    final_state = dict(final_state)
+    final_state["agent_trace"] = run_trace.to_dict()
+    final_state["run_id"] = run_trace.run_id
+    run_trace.add("run_end", "Investigation complete")
+    log.info(
+        "Investigation complete run=%s duration_ms=%s events=%s",
+        run_trace.run_id[:8],
+        run_trace.to_dict()["duration_ms"],
+        len(run_trace.events),
+    )
+    return final_state
 
 
-def render_investigation_result(final_state: dict[str, Any]) -> str:
+def render_investigation_result(
+    final_state: dict[str, Any],
+    *,
+    include_observability: bool = True,
+) -> str:
     """Pretty-print a LangGraph investigation result as markdown-ish text."""
     lines = ["# LangGraph Investigation Report", ""]
+    run_id = final_state.get("run_id")
+    if run_id:
+        lines.append(f"- run_id: `{run_id}`")
     plan = final_state.get("expanded_plan")
     if plan is not None:
         intent = getattr(plan, "intent", None) or (plan.get("intent") if isinstance(plan, dict) else None)
@@ -427,4 +531,9 @@ def render_investigation_result(final_state: dict[str, Any]) -> str:
             lines.append("")
     lines.append("## Root Cause Analysis")
     lines.append(str(final_state.get("final_rca") or "No RCA generated."))
+
+    if include_observability:
+        restored = AgentRunTrace.from_dict(final_state.get("agent_trace"))
+        if restored and restored.events:
+            lines.extend(["", restored.render_markdown()])
     return "\n".join(lines)

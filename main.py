@@ -14,6 +14,7 @@ from osp_sos_analyser.langgraph_investigator import (
     render_investigation_result,
 )
 from osp_sos_analyser.chat_ui import launch_chat
+from osp_sos_analyser.observability import configure_logging, get_logger
 from pydantic import BaseModel, Field
 
 
@@ -99,6 +100,16 @@ def build_analyze_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use the old deterministic search workflow without an LLM.",
     )
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        help="Backend log level (default OSP_SOS_LOG_LEVEL or INFO)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Optional log file path (default OSP_SOS_LOG_FILE)",
+    )
     return parser
 
 
@@ -126,17 +137,30 @@ def build_chat_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Create a temporary public Gradio share link",
     )
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        help="Backend log level (default OSP_SOS_LOG_LEVEL or INFO)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Optional log file path (default OSP_SOS_LOG_FILE)",
+    )
     return parser
 
 
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "analyze":
         args = build_analyze_parser().parse_args(sys.argv[2:])
+        configure_logging(level=args.log_level, log_file=args.log_file)
+        log = get_logger("cli")
         if args.offline:
             report = investigate_prompt_offline(db_path=args.db_path, prompt=args.prompt)
             print(report.render_markdown())
         else:
             try:
+                log.info("Analyze prompt=%s", args.prompt)
                 print(f"User Prompt: {args.prompt}")
                 result = investigate_with_langgraph(
                     db_path=args.db_path,
@@ -145,7 +169,7 @@ def main() -> None:
                 )
             except MissingLLMConfiguration as exc:
                 raise SystemExit(str(exc)) from exc
-            print(render_investigation_result(result))
+            print(render_investigation_result(result, include_observability=True))
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "chat":
@@ -157,6 +181,8 @@ def main() -> None:
             host=args.host,
             port=args.port,
             share=args.share,
+            log_level=args.log_level,
+            log_file=args.log_file,
         )
         return
 
@@ -165,6 +191,7 @@ def main() -> None:
     else:
         argv = sys.argv[1:]
     args = build_ingest_parser().parse_args(argv)
+    configure_logging()
     db_path = ingest_sos_reports(
         reports_dir=args.reports_dir,
         db_path=args.db_path,

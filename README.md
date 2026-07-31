@@ -115,7 +115,24 @@ Show the VM → port → chassis → host path for port <uuid>
 
 Or in the chat UI set **Focused entity** and **Operation path first**.
 
+## Backend logging & agent observability
+
+Investigation runs emit structured logs and an in-answer timeline of LangGraph nodes, LLM calls, and tool use.
+
+```powershell
+# console + file
+$env:OSP_SOS_LOG_LEVEL="INFO"
+$env:OSP_SOS_LOG_FILE="osp_sos.log"
+uv run python main.py chat --db-path sos_analysis.duckdb --log-file osp_sos.log
+
+# CLI analyze also prints the agent timeline under the RCA
+uv run python main.py analyze "port UUID failed" --db-path sos_analysis.duckdb --log-file osp_sos.log
+```
+
+In the chat UI, keep **Show agent observability** enabled to append the node/tool timeline under each answer.
+
 ## Chat UI (ask / answer)
+
 
 
 
