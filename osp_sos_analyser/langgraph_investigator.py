@@ -1,11 +1,13 @@
 # langgraph_investigator.py — LangGraph RCA workflow (moved out of osp.ipynb).
 from __future__ import annotations
 
+import json
 import os
+import re
 from typing import Any, Dict, List, Optional, TypedDict
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .context_pack import truncate_text
 from .investigation_tools import build_langchain_tools, prefetch_investigation_digest
@@ -19,19 +21,36 @@ from .observability import (
 
 
 EXPAND_SYSTEM_PROMPT = """You are a query enrichment agent for a Red Hat OpenStack investigation workflow.
-Return JSON only with the fields: summary, intent, entities, keywords, search_queries, investigation_targets, hypotheses, time_window.
+Return ONE compact JSON object only — no markdown, no commentary.
 
-CRITICAL RULES:
-- `keywords` MUST include any UUIDs, hostnames, or instance names verbatim from the incident report. Do NOT replace them with concept words like 'VM' or 'creation'.
-- `keywords` should be lowercase tokens that would actually appear in OpenStack logs (e.g. 'failed', 'error', 'spawn', 'build', the UUID itself).
+Required fields:
+  summary, intent, entities, keywords, search_queries, investigation_targets, hypotheses, time_window
+
+CRITICAL RULES (follow exactly):
+- Keep EVERY string SHORT. summary ≤ 160 chars. intent ≤ 80 chars.
+- `entities.node_role` MUST be exactly one of: controller | compute | storage | unknown
+  NEVER put keywords, log phrases, or hyphenated dumps into node_role.
+- `entities.hostname` is a short hostname only (e.g. "comp008"), ≤ 64 chars, or null.
 - `entities.service` may be: nova, cinder, neutron, glance, keystone, heat, octavia, ironic, system, or unknown.
-- `entities.resource_id` MUST be the UUID if present in the incident.
-- Use `system` for controller/compute host reboots, kernel, hardware, podman, or OS-level symptoms.
-- Use `unknown` when the incident does not explicitly identify an OpenStack service. Do not select nova by default.
-- Do not fetch more than 10 to 20 events or logs per query.
-- Every selected service must be justified by words in the incident.
-- Keep output lightweight and valid JSON.
+- Use `system` for host reboots, kernel, hardware, or OS-level symptoms.
+- `keywords`: 3–12 short lowercase tokens (hostnames, UUIDs, error words). Each ≤ 48 chars.
+- `investigation_targets`: 2–8 short labels (e.g. "system", "kernel", "nova-compute"). Each ≤ 48 chars.
+- `search_queries`: at most 5 items; each query string ≤ 120 chars.
+- `hypotheses`: at most 5 short strings.
+- Do NOT invent long keyword chains. Do NOT repeat the same phrase.
+- Prefer null over inventing entities.
+- Output must be valid, complete JSON that fits in a small response.
 """
+
+_KNOWN_NODE_ROLES = frozenset({"controller", "compute", "storage", "network", "ceph", "unknown"})
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+_HOSTNAME_RE = re.compile(
+    r"\b((?:ctrl|comp|compute|controller|ceph|storage|wrkld|node)[\w.-]*\d[\w.-]*)\b",
+    re.IGNORECASE,
+)
+_SHORT_HOSTNAME_RE = re.compile(r"\b([a-z][a-z0-9-]{1,30}\d{2,})\b", re.IGNORECASE)
 
 INVESTIGATOR_SYSTEM_PROMPT = """
 You are an OpenStack RCA investigator.
@@ -54,53 +73,352 @@ Stop once you can explain or rule out a root cause. End with a concise RCA.
 """
 
 
+def _clip_str(value: Any, max_len: int) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) > max_len:
+        return text[:max_len].rstrip("-_ .")
+    return text
+
+
+def _normalize_node_role(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in _KNOWN_NODE_ROLES:
+        return text
+    # Models sometimes dump keywords into node_role; salvage a known token.
+    for role in ("controller", "compute", "storage", "network", "ceph"):
+        if re.search(rf"\b{role}\b", text) or text.startswith(role):
+            return role
+    if len(text) > 32:
+        return None
+    return None
+
+
+def _clean_token_list(values: Any, *, max_items: int, max_len: int) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        token = _clip_str(raw, max_len)
+        if not token:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(token)
+        if len(out) >= max_items:
+            break
+    return out
+
+
 class InvestigationEntities(BaseModel):
     investigation_id: Optional[str] = Field(default_factory=lambda: str(uuid4()))
     resource_id: Optional[str] = Field(
         default=None,
-        description="Any UUID at the center of the investigation — instance, volume, port, network, image, etc.",
+        description="UUID at the center of the investigation, if present.",
+        max_length=64,
     )
     resource_type: Optional[str] = Field(
         default=None,
-        description="e.g. 'instance', 'volume', 'port', 'network', 'image'",
+        description="instance | volume | port | network | image | host",
+        max_length=32,
     )
-    service: Optional[str] = Field(default=None)
-    problem: Optional[str] = Field(default=None)
-    cluster: Optional[str] = Field(default=None)
+    service: Optional[str] = Field(
+        default=None,
+        description="nova|cinder|neutron|glance|keystone|heat|octavia|ironic|system|unknown",
+        max_length=32,
+    )
+    problem: Optional[str] = Field(default=None, max_length=120)
+    cluster: Optional[str] = Field(default=None, max_length=64)
     hostname: Optional[str] = Field(
         default=None,
-        description="Hostname if the incident is tied to one SOS node",
+        description="Short hostname only, e.g. comp008",
+        max_length=64,
     )
     node_role: Optional[str] = Field(
         default=None,
-        description="controller, compute, or other role when known",
+        description="Exactly one of: controller, compute, storage, unknown",
+        max_length=32,
     )
+
+    @field_validator("resource_id", mode="before")
+    @classmethod
+    def _clip_resource_id(cls, value: Any) -> Any:
+        return _clip_str(value, 64)
+
+    @field_validator("resource_type", "service", mode="before")
+    @classmethod
+    def _clip_short_enums(cls, value: Any) -> Any:
+        return _clip_str(value, 32)
+
+    @field_validator("problem", mode="before")
+    @classmethod
+    def _clip_problem(cls, value: Any) -> Any:
+        return _clip_str(value, 120)
+
+    @field_validator("cluster", mode="before")
+    @classmethod
+    def _clip_cluster(cls, value: Any) -> Any:
+        return _clip_str(value, 64)
+
+    @field_validator("hostname", mode="before")
+    @classmethod
+    def _clip_hostname(cls, value: Any) -> Any:
+        return _clip_str(value, 64)
+
+    @field_validator("node_role", mode="before")
+    @classmethod
+    def _coerce_node_role(cls, value: Any) -> Any:
+        return _normalize_node_role(value)
 
 
 class TimeWindow(BaseModel):
-    start: Optional[str] = Field(default=None)
-    end: Optional[str] = Field(default=None)
+    start: Optional[str] = Field(default=None, max_length=64)
+    end: Optional[str] = Field(default=None, max_length=64)
 
 
 class SearchTask(BaseModel):
-    service: str
-    objective: str
-    query: str
-    priority: int
+    service: str = Field(max_length=32)
+    objective: str = Field(max_length=160)
+    query: str = Field(max_length=160)
+    priority: int = Field(default=1, ge=1, le=10)
+
+    @field_validator("service", "objective", "query", mode="before")
+    @classmethod
+    def _clip_search_fields(cls, value: Any) -> Any:
+        return _clip_str(value, 160) or ""
 
 
 class ExpandedQuery(BaseModel):
-    summary: str
-    intent: str
+    summary: str = Field(max_length=240)
+    intent: str = Field(max_length=120)
     entities: InvestigationEntities
-    keywords: List[str]
+    keywords: List[str] = Field(default_factory=list, max_length=16)
     search_queries: List[SearchTask] = Field(
         default_factory=list,
-        description="Search tasks with service, objective, query, and priority.",
+        description="At most 5 search tasks.",
+        max_length=5,
     )
-    investigation_targets: List[str]
-    hypotheses: List[str] = Field(default_factory=list)
+    investigation_targets: List[str] = Field(default_factory=list, max_length=12)
+    hypotheses: List[str] = Field(default_factory=list, max_length=5)
     time_window: Optional[TimeWindow] = Field(default=None)
+
+    @field_validator("summary", "intent", mode="before")
+    @classmethod
+    def _clip_top_strings(cls, value: Any) -> Any:
+        return _clip_str(value, 240) or ""
+
+    @field_validator("keywords", "investigation_targets", "hypotheses", mode="before")
+    @classmethod
+    def _clean_lists(cls, value: Any) -> Any:
+        return _clean_token_list(value, max_items=16, max_len=48)
+
+    @model_validator(mode="after")
+    def _trim_collections(self) -> "ExpandedQuery":
+        self.keywords = _clean_token_list(self.keywords, max_items=12, max_len=48)
+        self.investigation_targets = _clean_token_list(
+            self.investigation_targets, max_items=8, max_len=48
+        )
+        self.hypotheses = _clean_token_list(self.hypotheses, max_items=5, max_len=120)
+        if len(self.search_queries) > 5:
+            self.search_queries = self.search_queries[:5]
+        return self
+
+
+def _extract_hostname_from_text(text: str) -> Optional[str]:
+    match = _HOSTNAME_RE.search(text or "")
+    if match:
+        return match.group(1)
+    match = _SHORT_HOSTNAME_RE.search(text or "")
+    if match:
+        return match.group(1)
+    return None
+
+
+def _guess_node_role(text: str) -> Optional[str]:
+    lower = (text or "").lower()
+    if re.search(r"\bcomput", lower):
+        return "compute"
+    if re.search(r"\bcontrol", lower):
+        return "controller"
+    if re.search(r"\bstorage|\bceph\b", lower):
+        return "storage"
+    return None
+
+
+def fallback_expanded_query(raw_query: str) -> ExpandedQuery:
+    """Heuristic ExpandedQuery when the LLM returns truncated/invalid JSON."""
+    text = (raw_query or "").strip()
+    lower = text.lower()
+    hostname = _extract_hostname_from_text(text)
+    node_role = _guess_node_role(text)
+    uuids = _UUID_RE.findall(text)
+
+    keywords = _clean_token_list(
+        [
+            hostname,
+            *uuids[:2],
+            *(
+                token
+                for token in (
+                    "reboot",
+                    "kernel",
+                    "panic",
+                    "oom",
+                    "crash",
+                    "failed",
+                    "error",
+                    "timeout",
+                    "nova-compute",
+                    "shutdown",
+                    "power",
+                )
+                if token in lower
+            ),
+        ],
+        max_items=12,
+        max_len=48,
+    )
+    if not keywords:
+        keywords = _clean_token_list(re.findall(r"[a-z0-9-]{3,}", lower)[:8], max_items=8, max_len=48)
+
+    service = "system"
+    if any(w in lower for w in ("neutron", "ovn", "port binding", "chassis")):
+        service = "neutron"
+    elif any(w in lower for w in ("cinder", "volume")):
+        service = "cinder"
+    elif any(w in lower for w in ("glance", "image")):
+        service = "glance"
+    elif any(w in lower for w in ("nova", "instance", "spawn", "vm ")) and "reboot" not in lower:
+        service = "nova"
+    elif any(w in lower for w in ("reboot", "kernel", "panic", "hardware", "power")):
+        service = "system"
+
+    targets = ["system"]
+    if service != "system":
+        targets.append(service)
+    if "reboot" in lower or "panic" in lower:
+        targets.extend(["kernel", "journal", "nova-compute"])
+    if hostname:
+        targets.append(hostname)
+
+    summary = truncate_text(text.replace("\n", " "), 160) or "Investigate OpenStack incident"
+    return ExpandedQuery(
+        summary=summary,
+        intent="investigate_incident",
+        entities=InvestigationEntities(
+            resource_id=uuids[0] if uuids else None,
+            resource_type="host" if hostname and service == "system" else None,
+            service=service,
+            problem=truncate_text(text.replace("\n", " "), 120),
+            hostname=hostname,
+            node_role=node_role or ("compute" if hostname and hostname.lower().startswith("comp") else None),
+        ),
+        keywords=keywords,
+        search_queries=[
+            SearchTask(
+                service=service,
+                objective="Find host/system errors around the incident",
+                query=" ".join(keywords[:6]) or "error failed",
+                priority=1,
+            )
+        ],
+        investigation_targets=_clean_token_list(targets, max_items=8, max_len=48),
+        hypotheses=[],
+        time_window=None,
+    )
+
+
+def sanitize_expanded_query(plan: ExpandedQuery | dict[str, Any] | None, raw_query: str = "") -> ExpandedQuery:
+    """Normalize a parsed plan; fall back if empty/invalid."""
+    if plan is None:
+        return fallback_expanded_query(raw_query)
+    if isinstance(plan, dict):
+        try:
+            plan = ExpandedQuery.model_validate(plan)
+        except Exception:
+            return fallback_expanded_query(raw_query)
+    # Re-run validators via model_validate to clip any post-parse mutations.
+    try:
+        cleaned = ExpandedQuery.model_validate(plan.model_dump())
+    except Exception:
+        return fallback_expanded_query(raw_query)
+    if not cleaned.keywords and raw_query:
+        fb = fallback_expanded_query(raw_query)
+        cleaned.keywords = fb.keywords
+        if not cleaned.entities.hostname:
+            cleaned.entities.hostname = fb.entities.hostname
+        if not cleaned.entities.node_role:
+            cleaned.entities.node_role = fb.entities.node_role
+        if not cleaned.investigation_targets:
+            cleaned.investigation_targets = fb.investigation_targets
+    return cleaned
+
+
+def _parse_partial_expanded_json(text: str, raw_query: str) -> ExpandedQuery:
+    """Best-effort parse when the model returns truncated JSON."""
+    blob = (text or "").strip()
+    if not blob:
+        return fallback_expanded_query(raw_query)
+    # Strip markdown fences if present.
+    if blob.startswith("```"):
+        blob = re.sub(r"^```(?:json)?\s*", "", blob)
+        blob = re.sub(r"\s*```$", "", blob)
+    try:
+        data = json.loads(blob)
+        return sanitize_expanded_query(data, raw_query)
+    except json.JSONDecodeError:
+        pass
+
+    # Salvage truncated JSON object by closing open braces/quotes roughly.
+    start = blob.find("{")
+    if start < 0:
+        return fallback_expanded_query(raw_query)
+    candidate = blob[start:]
+    # Cut runaway node_role / string values at a reasonable length if unterminated.
+    def _fix_node_role(match: re.Match[str]) -> str:
+        role = _normalize_node_role(match.group(2) or "") or "unknown"
+        return f'{match.group(1)}{role}"'
+
+    candidate = re.sub(
+        r'("node_role"\s*:\s*")([^"]{0,64})[^"]*',
+        _fix_node_role,
+        candidate,
+        count=1,
+    )
+    # Try progressively truncating at last complete-looking key boundary.
+    for end in range(len(candidate), max(len(candidate) - 8000, 40), -1):
+        snippet = candidate[:end].rstrip(", \n\t")
+        # Close open strings/braces naively.
+        if snippet.count('"') % 2 == 1:
+            snippet += '"'
+        open_braces = snippet.count("{") - snippet.count("}")
+        open_brackets = snippet.count("[") - snippet.count("]")
+        snippet += "]" * max(open_brackets, 0)
+        snippet += "}" * max(open_braces, 0)
+        try:
+            data = json.loads(snippet)
+            if isinstance(data, dict):
+                data.setdefault("keywords", [])
+                data.setdefault("investigation_targets", [])
+                data.setdefault("summary", truncate_text(raw_query, 160) or "Investigate")
+                data.setdefault("intent", "investigate_incident")
+                data.setdefault("entities", {})
+                return sanitize_expanded_query(data, raw_query)
+        except Exception:
+            continue
+    return fallback_expanded_query(raw_query)
 
 
 class InvestigationState(TypedDict, total=False):
@@ -261,18 +579,57 @@ def build_investigation_app(
     def expand_query_node(state: InvestigationState) -> dict:
         run_trace.node_start("QUERY_EXPAND")
         log.info("Expanding query for run %s", run_trace.run_id[:8])
-        structured_llm = llm.with_structured_output(ExpandedQuery, method="json_schema")
-        enrichment_chain = {"query": RunnablePassthrough()} | prompt_expand | structured_llm
+        raw_query = state["raw_query"]
         expand_cb = AgentObservabilityCallback(run_trace, stage="query_expand")
         run_trace.llm_start("query_expand")
-        result = enrichment_chain.invoke(
-            state["raw_query"],
-            config=RunnableConfig(callbacks=[expand_cb.handler]),
-        )
+        result: ExpandedQuery | None = None
+        parse_error: str | None = None
+        try:
+            structured_llm = llm.with_structured_output(
+                ExpandedQuery, method="json_schema"
+            )
+            enrichment_chain = (
+                {"query": RunnablePassthrough()} | prompt_expand | structured_llm
+            )
+            result = enrichment_chain.invoke(
+                raw_query,
+                config=RunnableConfig(callbacks=[expand_cb.handler]),
+            )
+            result = sanitize_expanded_query(result, raw_query)
+        except Exception as exc:
+            parse_error = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "Structured expand failed (%s); attempting salvage/fallback",
+                truncate_text(parse_error, 200),
+            )
+            # Prefer salvaging model text from the exception when available.
+            completion = getattr(exc, "llm_output", None) or getattr(exc, "completion", None)
+            if isinstance(completion, dict):
+                completion = completion.get("text") or completion.get("content")
+            if not completion:
+                # LangChain OutputParserException often stores the raw text here.
+                completion = getattr(exc, "text", None) or str(exc)
+            # Strip the leading "Failed to parse ..." wrapper if present.
+            if isinstance(completion, str) and "from completion" in completion:
+                idx = completion.find("{")
+                if idx >= 0:
+                    completion = completion[idx:]
+            try:
+                result = _parse_partial_expanded_json(str(completion or ""), raw_query)
+            except Exception:
+                result = fallback_expanded_query(raw_query)
+            run_trace.add(
+                "plan_fallback",
+                "Used salvage/fallback ExpandedQuery after parse failure",
+                details={"error": truncate_text(parse_error, 240)},
+            )
+
+        assert result is not None
         run_trace.llm_end(
             "query_expand",
             intent=getattr(result, "intent", None),
             resource_id=getattr(getattr(result, "entities", None), "resource_id", None),
+            fallback=bool(parse_error),
         )
         run_trace.add(
             "plan",
@@ -280,7 +637,10 @@ def build_investigation_app(
             details={
                 "summary": getattr(result, "summary", ""),
                 "intent": getattr(result, "intent", ""),
+                "hostname": getattr(getattr(result, "entities", None), "hostname", None),
+                "node_role": getattr(getattr(result, "entities", None), "node_role", None),
                 "keywords": list(getattr(result, "keywords", []) or [])[:8],
+                "fallback": bool(parse_error),
             },
         )
 
@@ -289,7 +649,7 @@ def build_investigation_app(
             resource_id = result.entities.resource_id
         digest = prefetch_investigation_digest(
             db_con,
-            raw_query=state["raw_query"],
+            raw_query=raw_query,
             resource_id=resource_id,
             keywords=list(result.keywords or [])[:8],
             limit_per_entity=12,

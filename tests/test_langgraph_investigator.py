@@ -12,7 +12,11 @@ from osp_sos_analyser.langgraph_investigator import (
     ExpandedQuery,
     InvestigationEntities,
     _init_llm,
+    _normalize_node_role,
+    _parse_partial_expanded_json,
+    fallback_expanded_query,
     render_investigation_result,
+    sanitize_expanded_query,
 )
 from osp_sos_analyser.llm_client import MissingLLMConfiguration
 
@@ -182,3 +186,65 @@ class LangGraphInvestigatorModuleTests(unittest.TestCase):
             self.assertIn("entities", tables)
             self.assertIn("entity_mentions", tables)
             self.assertIn("entity_relationships", tables)
+
+
+class ExpandedQueryHardeningTests(unittest.TestCase):
+    def test_normalize_node_role_salvages_keyword_dump(self) -> None:
+        dump = (
+            "compute-node-auto-rebooted-unexpectedly-analyze-it-root-cause-"
+            "investigation-system-level-issue-host-failure-kernel-panic"
+        )
+        self.assertEqual(_normalize_node_role(dump), "compute")
+        self.assertEqual(_normalize_node_role("controller"), "controller")
+        self.assertIsNone(_normalize_node_role("totally-made-up-role-name-that-is-long"))
+
+    def test_entities_coerce_runaway_node_role(self) -> None:
+        ent = InvestigationEntities(
+            hostname="comp008",
+            node_role="compute-node-auto-rebooted-" + ("x" * 500),
+        )
+        self.assertEqual(ent.node_role, "compute")
+        self.assertEqual(ent.hostname, "comp008")
+
+    def test_fallback_expanded_query_for_compute_reboot(self) -> None:
+        plan = fallback_expanded_query(
+            "compute node comp008 auto-rebooted unexpectedly; analyze root cause"
+        )
+        self.assertEqual(plan.entities.hostname, "comp008")
+        self.assertEqual(plan.entities.node_role, "compute")
+        self.assertEqual(plan.entities.service, "system")
+        self.assertIn("reboot", plan.keywords)
+        self.assertTrue(plan.investigation_targets)
+
+    def test_sanitize_fills_missing_keywords_from_query(self) -> None:
+        plan = ExpandedQuery(
+            summary="Investigate reboot",
+            intent="system",
+            entities=InvestigationEntities(service="system"),
+            keywords=[],
+            investigation_targets=[],
+        )
+        cleaned = sanitize_expanded_query(
+            plan, "compute node comp008 auto-rebooted unexpectedly"
+        )
+        self.assertEqual(cleaned.entities.hostname, "comp008")
+        self.assertIn("reboot", cleaned.keywords)
+
+    def test_parse_partial_json_with_truncated_node_role(self) -> None:
+        # Mimic the user failure: truncated completion with runaway node_role.
+        blob = (
+            '{"summary": "Investigate unexpected auto-reboot on compute node comp008.", '
+            '"intent": "Analyze the cause of a compute node auto-reboot.", '
+            '"entities": {"hostname": "comp008", "node_role": "compute-node-auto-rebooted-'
+            + ("unexpectedly-analyze-it-" * 80)
+            + "truncated"
+        )
+        plan = _parse_partial_expanded_json(
+            blob,
+            "compute node comp008 auto-rebooted unexpectedly",
+        )
+        self.assertIsInstance(plan, ExpandedQuery)
+        self.assertEqual(plan.entities.hostname or "comp008", "comp008")
+        # Either salvaged from partial JSON or heuristic fallback.
+        self.assertIn(plan.entities.node_role, {None, "compute"})
+        self.assertTrue(plan.keywords or plan.summary)
