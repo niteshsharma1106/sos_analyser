@@ -16,7 +16,12 @@ from osp_sos_analyser.cluster_loader import (
     is_valid_hostname,
     NodeManifest,
 )
-from osp_sos_analyser.evidence_index import get_cluster_manifest, get_evidence, get_entity
+from osp_sos_analyser.evidence_index import (
+    build_evidence_index,
+    get_cluster_manifest,
+    get_evidence,
+    get_entity,
+)
 from osp_sos_analyser.ingest import ingest_sos_reports
 
 
@@ -189,3 +194,40 @@ class ClusterManifestAndEvidenceIndexTests(unittest.TestCase):
                 comparison_hosts = {row["hostname"] for row in comparison}
                 self.assertIn("controller-0", comparison_hosts)
                 self.assertIn("compute-03", comparison_hosts)
+
+    def test_evidence_index_survives_batched_inserts_on_disk_db(self) -> None:
+        """Regression: DuckDB fetchmany + INSERT on one connection returns [(1,)]."""
+        from osp_sos_analyser.db import ensure_schema
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "evidence.duckdb"
+            with duckdb.connect(str(db_path)) as conn:
+                ensure_schema(conn)
+                # Enough UUID-bearing rows to force multiple scan pages + flushes.
+                rows = [
+                    (
+                        f"2026-07-09 14:00:{i % 60:02d}.000",
+                        "ERROR",
+                        "nova",
+                        f"failed instance {i:08x}-bbbb-cccc-dddd-eeeeeeeeeeee on host",
+                        "var/log/containers/nova/nova-compute.log",
+                        "sosreport-compute-03",
+                        "compute-03",
+                    )
+                    for i in range(4500)
+                ]
+                conn.executemany(
+                    """
+                    INSERT INTO os_logs (
+                        timestamp, level, service, message, source_file,
+                        report_name, hostname
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                stats = build_evidence_index(conn)
+                self.assertGreaterEqual(stats["entities"], 4500)
+                self.assertGreaterEqual(stats["mentions"], 4500)
+                # Spot-check one entity survived paging + inserts.
+                entity = get_entity(conn, "00000000-bbbb-cccc-dddd-eeeeeeeeeeee")
+                self.assertIsNotNone(entity)

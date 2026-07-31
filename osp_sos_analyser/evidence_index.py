@@ -120,18 +120,9 @@ def build_evidence_index(conn: Any, *, report_name: str | None = None) -> dict[s
     mentions_per_entity: dict[str, int] = {}
     max_mentions_per_entity = 80
     insert_batch_size = 2000
+    page_size = 2000
     scanned = 0
     started = time.perf_counter()
-
-    result = conn.execute(
-        f"""
-        SELECT timestamp, level, service, message, source_file, report_name,
-               COALESCE(hostname, '') AS hostname
-        FROM os_logs
-        WHERE {where_sql}
-        """,
-        params,
-    )
 
     def _flush_mentions(force: bool = False) -> None:
         nonlocal mention_rows
@@ -150,65 +141,114 @@ def build_evidence_index(conn: Any, *, report_name: str | None = None) -> dict[s
         )
         mention_rows = []
 
-    while True:
-        chunk = result.fetchmany(1000)
-        if not chunk:
-            break
-        for timestamp, level, service, message, source_file, report, hostname in chunk:
-            scanned += 1
-            text = str(message or "")
-            for entity_id in extract_entity_ids(text):
-                if mentions_per_entity.get(entity_id, 0) >= max_mentions_per_entity:
-                    # Still update aggregate counts/timestamps without storing more digests.
-                    meta = entity_meta.get(entity_id)
-                    if meta is not None:
-                        meta["mention_count"] += 1
-                        if timestamp is not None:
-                            if meta["first_seen"] is None or timestamp < meta["first_seen"]:
-                                meta["first_seen"] = timestamp
-                            if meta["last_seen"] is None or timestamp > meta["last_seen"]:
-                                meta["last_seen"] = timestamp
-                    continue
-                entity_type = classify_entity_type(entity_id, text, str(service or ""))
-                meta = entity_meta.setdefault(
+    def _process_row(row: Sequence[Any]) -> None:
+        nonlocal scanned
+        if not isinstance(row, (list, tuple)) or len(row) < 7:
+            raise RuntimeError(
+                f"Evidence index got unexpected row shape {row!r} (len="
+                f"{len(row) if isinstance(row, (list, tuple)) else 'n/a'}). "
+                "This usually means the DuckDB result cursor was invalidated by "
+                "a write on the same connection."
+            )
+        timestamp, level, service, message, source_file, report, hostname = row[:7]
+        scanned += 1
+        text = str(message or "")
+        for entity_id in extract_entity_ids(text):
+            if mentions_per_entity.get(entity_id, 0) >= max_mentions_per_entity:
+                # Still update aggregate counts/timestamps without storing more digests.
+                meta = entity_meta.get(entity_id)
+                if meta is not None:
+                    meta["mention_count"] += 1
+                    if timestamp is not None:
+                        if meta["first_seen"] is None or timestamp < meta["first_seen"]:
+                            meta["first_seen"] = timestamp
+                        if meta["last_seen"] is None or timestamp > meta["last_seen"]:
+                            meta["last_seen"] = timestamp
+                continue
+            entity_type = classify_entity_type(entity_id, text, str(service or ""))
+            meta = entity_meta.setdefault(
+                entity_id,
+                {
+                    "entity_type": entity_type,
+                    "mention_count": 0,
+                    "first_seen": timestamp,
+                    "last_seen": timestamp,
+                },
+            )
+            if meta["entity_type"] == "unknown" and entity_type != "unknown":
+                meta["entity_type"] = entity_type
+            meta["mention_count"] += 1
+            if timestamp is not None:
+                if meta["first_seen"] is None or timestamp < meta["first_seen"]:
+                    meta["first_seen"] = timestamp
+                if meta["last_seen"] is None or timestamp > meta["last_seen"]:
+                    meta["last_seen"] = timestamp
+            mention_rows.append(
+                (
                     entity_id,
-                    {
-                        "entity_type": entity_type,
-                        "mention_count": 0,
-                        "first_seen": timestamp,
-                        "last_seen": timestamp,
-                    },
+                    entity_type,
+                    timestamp,
+                    str(hostname or ""),
+                    str(service or ""),
+                    str(level or ""),
+                    str(source_file or ""),
+                    str(report or ""),
+                    truncate_text(text, DIGEST_MESSAGE_CHARS),
                 )
-                if meta["entity_type"] == "unknown" and entity_type != "unknown":
-                    meta["entity_type"] = entity_type
-                meta["mention_count"] += 1
-                if timestamp is not None:
-                    if meta["first_seen"] is None or timestamp < meta["first_seen"]:
-                        meta["first_seen"] = timestamp
-                    if meta["last_seen"] is None or timestamp > meta["last_seen"]:
-                        meta["last_seen"] = timestamp
-                mention_rows.append(
-                    (
-                        entity_id,
-                        entity_type,
-                        timestamp,
-                        str(hostname or ""),
-                        str(service or ""),
-                        str(level or ""),
-                        str(source_file or ""),
-                        str(report or ""),
-                        truncate_text(text, DIGEST_MESSAGE_CHARS),
-                    )
-                )
-                mentions_per_entity[entity_id] = mentions_per_entity.get(entity_id, 0) + 1
-            if scanned == 1 or scanned % 20000 == 0:
-                print(
-                    f"[progress] Evidence index: scanned {scanned}/{total_logs} row(s); "
-                    f"{len(entity_meta)} entit(y/ies)",
-                    flush=True,
-                )
-                _flush_mentions()
-        _flush_mentions()
+            )
+            mentions_per_entity[entity_id] = mentions_per_entity.get(entity_id, 0) + 1
+        if scanned == 1 or scanned % 20000 == 0:
+            print(
+                f"[progress] Evidence index: scanned {scanned}/{total_logs} row(s); "
+                f"{len(entity_meta)} entit(y/ies)",
+                flush=True,
+            )
+
+    # IMPORTANT: Do not fetchmany() + INSERT on the same DuckDB connection.
+    # A write invalidates the open result; the next fetchmany() returns junk
+    # like [(1,)] (rowcounts) and unpacking crashes with "expected 7, got 1".
+    # Materialize a numbered temp table once, then page by rid ranges.
+    conn.execute(
+        f"""
+        CREATE OR REPLACE TEMP TABLE _evidence_scan AS
+        SELECT
+            row_number() OVER () AS rid,
+            timestamp,
+            level,
+            service,
+            message,
+            source_file,
+            report_name,
+            COALESCE(hostname, '') AS hostname
+        FROM os_logs
+        WHERE {where_sql}
+        """,
+        params,
+    )
+    try:
+        max_rid = int(
+            conn.execute("SELECT COALESCE(MAX(rid), 0) FROM _evidence_scan").fetchone()[0]
+        )
+        rid_start = 1
+        while rid_start <= max_rid:
+            chunk = conn.execute(
+                """
+                SELECT timestamp, level, service, message, source_file, report_name, hostname
+                FROM _evidence_scan
+                WHERE rid >= ? AND rid < ?
+                ORDER BY rid
+                """,
+                [rid_start, rid_start + page_size],
+            ).fetchall()
+            if not chunk:
+                break
+            for row in chunk:
+                _process_row(row)
+            # Cursor is closed after fetchall — safe to insert on this connection.
+            _flush_mentions(force=True)
+            rid_start += page_size
+    finally:
+        conn.execute("DROP TABLE IF EXISTS _evidence_scan")
 
     _flush_mentions(force=True)
 
