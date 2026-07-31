@@ -3,9 +3,109 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from osp_sos_analyser.ingest import ingest_sos_reports
+from osp_sos_analyser.ingest import (
+    ingest_sos_reports,
+    windows_path_to_wsl,
+)
 from osp_sos_analyser.log_parser import parse_log_lines
+
+
+class JournalDecodeHelperTests(unittest.TestCase):
+    def test_windows_path_to_wsl_converts_drive_path(self) -> None:
+        converted = windows_path_to_wsl(
+            Path(r"C:\Users\nites\AppData\Local\Temp\osp-sos-journal\system.journal")
+        )
+        self.assertTrue(converted.startswith("/mnt/c/"))
+        self.assertIn("/Users/nites/AppData/Local/Temp/osp-sos-journal/system.journal", converted)
+        self.assertNotIn("\\", converted)
+
+    def test_skip_journals_env_continues_ingest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            reports_dir = tmp_path / "SOS_REPORTS"
+            reports_dir.mkdir()
+            archive_path = reports_dir / "sosreport-controller-2026-07-28-journal.tar.xz"
+            journal_bytes = b"not-a-real-journal"
+            messages = b"Jul 28 14:05:01 ctl01 kernel: still ingested\n"
+            with tarfile.open(archive_path, "w:xz") as archive:
+                journal_info = tarfile.TarInfo(
+                    "var/log/journal/deadbeef/system.journal"
+                )
+                journal_info.size = len(journal_bytes)
+                archive.addfile(
+                    journal_info, fileobj=__import__("io").BytesIO(journal_bytes)
+                )
+                messages_info = tarfile.TarInfo("var/log/messages")
+                messages_info.size = len(messages)
+                archive.addfile(
+                    messages_info, fileobj=__import__("io").BytesIO(messages)
+                )
+
+            db_path = tmp_path / "test.duckdb"
+            with patch.dict(os.environ, {"OSP_SOS_SKIP_JOURNALS": "1"}):
+                ingest_sos_reports(
+                    reports_dir=reports_dir,
+                    db_path=db_path,
+                    clear_existing=True,
+                )
+
+            import duckdb
+
+            with duckdb.connect(str(db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT source_file, message FROM os_logs ORDER BY source_file"
+                ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0], "var/log/messages")
+            self.assertIn("still ingested", rows[0][1])
+
+    def test_journalctl_failure_skips_without_aborting_ingest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            reports_dir = tmp_path / "SOS_REPORTS"
+            reports_dir.mkdir()
+            archive_path = reports_dir / "sosreport-controller-2026-07-28-journal.tar.xz"
+            journal_bytes = b"not-a-real-journal"
+            messages = b"Jul 28 14:05:01 ctl01 kernel: still ingested\n"
+            with tarfile.open(archive_path, "w:xz") as archive:
+                journal_info = tarfile.TarInfo(
+                    "var/log/journal/deadbeef/system.journal"
+                )
+                journal_info.size = len(journal_bytes)
+                archive.addfile(
+                    journal_info, fileobj=__import__("io").BytesIO(journal_bytes)
+                )
+                messages_info = tarfile.TarInfo("var/log/messages")
+                messages_info.size = len(messages)
+                archive.addfile(
+                    messages_info, fileobj=__import__("io").BytesIO(messages)
+                )
+
+            db_path = tmp_path / "test.duckdb"
+            with patch.dict(
+                os.environ,
+                {"OSP_SOS_JOURNALCTL_COMMAND": "false"},
+                clear=False,
+            ):
+                # Ensure skip-journals is not set from other tests.
+                os.environ.pop("OSP_SOS_SKIP_JOURNALS", None)
+                ingest_sos_reports(
+                    reports_dir=reports_dir,
+                    db_path=db_path,
+                    clear_existing=True,
+                )
+
+            import duckdb
+
+            with duckdb.connect(str(db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT source_file, message FROM os_logs ORDER BY source_file"
+                ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0], "var/log/messages")
+            self.assertIn("still ingested", rows[0][1])
 
 
 class IngestSosReportsTests(unittest.TestCase):

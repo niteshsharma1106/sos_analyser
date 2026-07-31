@@ -325,25 +325,98 @@ def _ingest_log_member(
     return rows
 
 
+# After an infrastructure-level journalctl/WSL failure, skip remaining binary
+# journals for this process so one bad WSL setup cannot abort the whole ingest.
+_JOURNAL_DECODE_SKIP_REASON: str | None = None
+
+
+def windows_path_to_wsl(path: Path | str) -> str:
+    """Convert a Windows path to the usual WSL `/mnt/<drive>/...` form."""
+    text = str(path)
+    if len(text) >= 2 and text[1] == ":":
+        drive = text[0].lower()
+        rest = text[2:].replace("\\", "/")
+        if not rest.startswith("/"):
+            rest = f"/{rest}"
+        return f"/mnt/{drive}{rest}"
+    return str(Path(path).resolve()).replace("\\", "/")
+
+
+def _wsl_prefix(distro: str | None) -> list[str]:
+    if distro:
+        return ["wsl.exe", "-d", distro, "--"]
+    return ["wsl.exe", "--"]
+
+
+def _resolve_wsl_distro() -> str | None:
+    """Return configured WSL distro, or None to use the user's default distro.
+
+    Do not default to podman-machine-default: that VM often lacks journalctl
+    and/or `/mnt/<drive>` mounts for Windows temp paths.
+    """
+    configured = os.getenv("OSP_SOS_WSL_DISTRO")
+    if configured is None:
+        return None
+    configured = configured.strip()
+    return configured or None
+
+
+def _map_windows_path_for_wsl(journal_file: Path, distro: str | None) -> str:
+    cmd = [*_wsl_prefix(distro), "wslpath", "-a", str(journal_file)]
+    try:
+        mapped = subprocess.run(
+            cmd,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=60,
+        ).stdout.strip()
+        if mapped:
+            return mapped
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+    return windows_path_to_wsl(journal_file)
+
+
 def _journalctl_command(journal_file: Path) -> list[str]:
     """Build the local command that decodes one binary systemd journal."""
     configured = os.getenv("OSP_SOS_JOURNALCTL_COMMAND")
     if configured:
-        return configured.split() + ["--no-pager", "--output=short-iso", "--file", str(journal_file)]
+        return configured.split() + [
+            "--no-pager",
+            "--output=short-iso",
+            "--file",
+            str(journal_file),
+        ]
     if os.name != "nt":
-        return ["journalctl", "--no-pager", "--output=short-iso", "--file", str(journal_file)]
+        return [
+            "journalctl",
+            "--no-pager",
+            "--output=short-iso",
+            "--file",
+            str(journal_file),
+        ]
 
-    distro = os.getenv("OSP_SOS_WSL_DISTRO", "podman-machine-default")
-    mapped = subprocess.run(
-        ["wsl.exe", "-d", distro, "--", "wslpath", "-a", str(journal_file)],
-        capture_output=True,
-        check=True,
-        text=True,
-    ).stdout.strip()
+    distro = _resolve_wsl_distro()
+    mapped = _map_windows_path_for_wsl(journal_file, distro)
     return [
-        "wsl.exe", "-d", distro, "--", "journalctl", "--no-pager",
-        "--output=short-iso", "--file", mapped,
+        *_wsl_prefix(distro),
+        "journalctl",
+        "--no-pager",
+        "--output=short-iso",
+        "--file",
+        mapped,
     ]
+
+
+def _discard_archive_member(archive: tarfile.TarFile, member: tarfile.TarInfo) -> None:
+    """Consume member bytes so streaming `r|xz` readers stay aligned."""
+    extracted = archive.extractfile(member)
+    if extracted is None:
+        return
+    with extracted:
+        while extracted.read(1024 * 1024):
+            pass
 
 
 def _ingest_systemd_journal_member(
@@ -355,45 +428,91 @@ def _ingest_systemd_journal_member(
     retain_recent_hours: float | None,
     manifest: NodeManifest | None = None,
 ) -> int:
+    global _JOURNAL_DECODE_SKIP_REASON
+
     source_file = normalized_member_name(member)
+    size_mb = member.size / 1024 / 1024
+
+    if os.getenv("OSP_SOS_SKIP_JOURNALS", "").strip().lower() in {"1", "true", "yes"}:
+        print(
+            f"[progress] {report_name}: skipping binary journal {log_index} "
+            f"{source_file} (OSP_SOS_SKIP_JOURNALS is set)",
+            flush=True,
+        )
+        _discard_archive_member(archive, member)
+        return 0
+
+    if _JOURNAL_DECODE_SKIP_REASON is not None:
+        print(
+            f"[progress] {report_name}: skipping binary journal {log_index} "
+            f"{source_file}: {_JOURNAL_DECODE_SKIP_REASON}",
+            flush=True,
+        )
+        _discard_archive_member(archive, member)
+        return 0
+
     print(
         f"[progress] {report_name}: decoding binary journal {log_index} "
-        f"{source_file} ({member.size / 1024 / 1024:.1f} MB)",
+        f"{source_file} ({size_mb:.1f} MB)",
         flush=True,
     )
     extracted = archive.extractfile(member)
     if extracted is None:
         raise SosReportError(f"Unable to extract journal member: {member.name}")
 
-    with tempfile.TemporaryDirectory(prefix="osp-sos-journal-") as temporary_directory:
-        journal_file = Path(temporary_directory) / Path(source_file).name
-        with extracted, journal_file.open("wb") as destination:
-            shutil.copyfileobj(extracted, destination, length=1024 * 1024)
+    try:
+        with tempfile.TemporaryDirectory(prefix="osp-sos-journal-") as temporary_directory:
+            journal_file = Path(temporary_directory) / Path(source_file).name
+            with extracted, journal_file.open("wb") as destination:
+                shutil.copyfileobj(extracted, destination, length=1024 * 1024)
 
-        process = subprocess.Popen(
-            _journalctl_command(journal_file),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        assert process.stdout is not None
-        rows = _insert_parsed_log_entries(
-            conn,
-            parse_log_lines(process.stdout, source_file, report_name),
-            source_file,
-            report_name,
-            retain_recent_hours,
-            manifest=manifest,
-        )
-        assert process.stderr is not None
-        error_output = process.stderr.read().strip()
-        if process.wait() != 0:
-            raise SosReportError(
-                f"journalctl could not decode {source_file}: {error_output or 'unknown error'}"
+            command = _journalctl_command(journal_file)
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
-    return rows
+            try:
+                assert process.stdout is not None
+                rows = _insert_parsed_log_entries(
+                    conn,
+                    parse_log_lines(process.stdout, source_file, report_name),
+                    source_file,
+                    report_name,
+                    retain_recent_hours,
+                    manifest=manifest,
+                )
+                assert process.stderr is not None
+                error_output = process.stderr.read().strip()
+                returncode = process.wait()
+            finally:
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+            if returncode != 0:
+                detail = error_output or f"exit status {returncode}"
+                raise SosReportError(
+                    f"journalctl could not decode {source_file}: {detail}"
+                )
+        return rows
+    except (SosReportError, OSError, subprocess.SubprocessError) as exc:
+        # Keep text logs + sos_commands; binary journals need a working journalctl.
+        _JOURNAL_DECODE_SKIP_REASON = str(exc)
+        print(
+            f"[progress] {report_name}: skipping binary journals after decode failure: {exc}\n"
+            f"[progress] Tip: set OSP_SOS_WSL_DISTRO to a distro with journalctl "
+            f"(e.g. Ubuntu), or OSP_SOS_SKIP_JOURNALS=1 to silence this, "
+            f"or OSP_SOS_JOURNALCTL_COMMAND to a custom decoder.",
+            flush=True,
+        )
+        return 0
 
 
 def _insert_parsed_log_entries(
@@ -457,6 +576,9 @@ def ingest_sos_reports(
     cluster_id: str | None = None,
 ) -> Path:
     """Ingest one or more RHOSP 17.x SOS report tar.xz archives into DuckDB."""
+    global _JOURNAL_DECODE_SKIP_REASON
+    _JOURNAL_DECODE_SKIP_REASON = None
+
     root = Path(reports_dir or "SOS_REPORTS").resolve()
     db_target = Path(db_path).resolve() if db_path else _default_db_path(root).resolve()
 
