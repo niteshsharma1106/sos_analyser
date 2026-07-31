@@ -10,34 +10,76 @@ from .models import CommandRecord, LogRecord
 
 
 IMPORTANT_LEVELS = ("ERROR", "CRITICAL", "WARNING")
+_LEVEL_RANK_SQL = """
+CASE level
+    WHEN 'CRITICAL' THEN 0
+    WHEN 'ERROR' THEN 1
+    WHEN 'WARNING' THEN 2
+    ELSE 3
+END
+"""
+_FAILURE_HINTS = (
+    "failed",
+    "failure",
+    "not ready",
+    "exception",
+    "traceback",
+    "timeout",
+    "unreachable",
+    "error",
+    "status: 5",
+    "status: 4",
+)
 
 
 class AnalysisStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
+        self._connection: duckdb.DuckDBPyConnection | None = None
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
-        return duckdb.connect(str(self.db_path), read_only=True)
+        if self._connection is None:
+            self._connection = duckdb.connect(str(self.db_path), read_only=True)
+        return self._connection
+
+    def close(self) -> None:
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+
+    def __enter__(self) -> "AnalysisStore":
+        self._connect()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self.close()
+        return False
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def table_counts(self) -> dict[str, int]:
-        with self._connect() as conn:
-            logs = conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0]
-            commands = conn.execute("SELECT COUNT(*) FROM os_commands").fetchone()[0]
+        conn = self._connect()
+        logs = conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0]
+        commands = conn.execute("SELECT COUNT(*) FROM os_commands").fetchone()[0]
         return {"os_logs": int(logs), "os_commands": int(commands)}
 
     def get_error_summary(self, limit: int = 20) -> tuple[tuple[str, str, int], ...]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT COALESCE(service, 'unknown') AS service, level, COUNT(*) AS count
-                FROM os_logs
-                WHERE level IN ('ERROR', 'CRITICAL')
-                GROUP BY service, level
-                ORDER BY count DESC, service
-                LIMIT ?
-                """,
-                [limit],
-            ).fetchall()
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT COALESCE(service, 'unknown') AS service, level, COUNT(*) AS count
+            FROM os_logs
+            WHERE level IN ('ERROR', 'CRITICAL')
+            GROUP BY service, level
+            ORDER BY count DESC, service
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
         return tuple((str(service), str(level), int(count)) for service, level, count in rows)
 
     def search_logs(
@@ -72,47 +114,31 @@ class AnalysisStore:
             params.extend([like, like, like])
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
+        # Fetch a small oversample, then score in Python so ORDER BY stays cheap.
+        fetch_limit = limit if chronological else min(max(limit * 3, limit), 150)
+        params.append(fetch_limit)
         order_by = (
             "timestamp NULLS LAST"
             if chronological
-            else """
-                    CASE
-                        WHEN message ILIKE '%failed%' THEN 0
-                        WHEN message ILIKE '%failure%' THEN 0
-                        WHEN message ILIKE '%not ready%' THEN 0
-                        WHEN message ILIKE '%exception%' THEN 0
-                        WHEN message ILIKE '%traceback%' THEN 0
-                        WHEN message ILIKE '%timeout%' THEN 0
-                        WHEN message ILIKE '%unreachable%' THEN 0
-                        WHEN message ILIKE '%error%' THEN 0
-                        WHEN message ILIKE '%status: 5%' THEN 1
-                        WHEN message ILIKE '%status: 4%' THEN 2
-                        WHEN message ILIKE '%status: 2%' THEN 5
-                        ELSE 3
-                    END,
-                    CASE level
-                        WHEN 'CRITICAL' THEN 0
-                        WHEN 'ERROR' THEN 1
-                        WHEN 'WARNING' THEN 2
-                        ELSE 3
-                    END,
-                    timestamp NULLS LAST
-            """
+            else f"{_LEVEL_RANK_SQL}, timestamp NULLS LAST"
         )
 
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT timestamp, level, service, module, message, source_file, report_name
-                FROM os_logs
-                {where}
-                ORDER BY {order_by}
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-        return tuple(_log_record(row) for row in rows)
+        conn = self._connect()
+        rows = conn.execute(
+            f"""
+            SELECT timestamp, level, service, module, message, source_file, report_name
+            FROM os_logs
+            {where}
+            ORDER BY {order_by}
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        records = [_log_record(row) for row in rows]
+        if chronological:
+            return tuple(records[:limit])
+        ranked = sorted(records, key=_relevance_key)
+        return tuple(ranked[:limit])
 
     def get_timeline(
         self,
@@ -140,17 +166,17 @@ class AnalysisStore:
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT timestamp, level, service, module, message, source_file, report_name
-                FROM os_logs
-                {where}
-                ORDER BY timestamp NULLS LAST
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
+        conn = self._connect()
+        rows = conn.execute(
+            f"""
+            SELECT timestamp, level, service, module, message, source_file, report_name
+            FROM os_logs
+            {where}
+            ORDER BY timestamp NULLS LAST
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
         return tuple(_log_record(row) for row in rows)
 
     def get_events_around(
@@ -169,17 +195,17 @@ class AnalysisStore:
             params.extend(services)
         params.append(limit)
 
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT timestamp, level, service, module, message, source_file, report_name
-                FROM os_logs
-                WHERE {' AND '.join(clauses)}
-                ORDER BY timestamp
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
+        conn = self._connect()
+        rows = conn.execute(
+            f"""
+            SELECT timestamp, level, service, module, message, source_file, report_name
+            FROM os_logs
+            WHERE {' AND '.join(clauses)}
+            ORDER BY timestamp
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
         return tuple(_log_record(row) for row in rows)
 
     def find_identifier_events(
@@ -195,17 +221,17 @@ class AnalysisStore:
             params.extend(services)
         params.append(limit)
 
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT timestamp, level, service, module, message, source_file, report_name
-                FROM os_logs
-                WHERE {' AND '.join(clauses)}
-                ORDER BY timestamp NULLS LAST
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
+        conn = self._connect()
+        rows = conn.execute(
+            f"""
+            SELECT timestamp, level, service, module, message, source_file, report_name
+            FROM os_logs
+            WHERE {' AND '.join(clauses)}
+            ORDER BY timestamp NULLS LAST
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
         return tuple(_log_record(row) for row in rows)
 
     def get_command_output(
@@ -221,18 +247,32 @@ class AnalysisStore:
             params.append(service)
         params.append(limit)
 
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT command, service, source_file, output, report_name
-                FROM os_commands
-                WHERE {' AND '.join(clauses)}
-                ORDER BY source_file
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
+        conn = self._connect()
+        rows = conn.execute(
+            f"""
+            SELECT command, service, source_file, output, report_name
+            FROM os_commands
+            WHERE {' AND '.join(clauses)}
+            ORDER BY source_file
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
         return tuple(_command_record(row) for row in rows)
+
+
+def _relevance_key(record: LogRecord) -> tuple[int, int, datetime | float]:
+    message = (record.message or "").lower()
+    hint_rank = 0
+    for index, hint in enumerate(_FAILURE_HINTS):
+        if hint in message:
+            hint_rank = index
+            break
+    else:
+        hint_rank = len(_FAILURE_HINTS)
+    level_rank = {"CRITICAL": 0, "ERROR": 1, "WARNING": 2}.get(record.level, 3)
+    ts = record.timestamp.timestamp() if record.timestamp is not None else float("inf")
+    return (hint_rank, level_rank, ts)
 
 
 def _log_record(row: tuple[object, ...]) -> LogRecord:

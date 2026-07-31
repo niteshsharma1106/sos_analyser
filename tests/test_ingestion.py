@@ -196,3 +196,76 @@ RuntimeError: boom
                     "SELECT COUNT(*) FROM ingested_reports WHERE status = 'completed'"
                 ).fetchone()[0]
                 self.assertEqual(registry, 1)
+
+
+class IngestDedupeAndParallelTests(unittest.TestCase):
+    def _write_sample_archive(self, archive_path: Path, marker: str) -> None:
+        with tarfile.open(archive_path, "w:xz") as archive:
+            payload = (
+                f"2026-07-09 11:27:48.123 45672 ERROR nova.compute.manager [-] {marker}\n"
+            ).encode("utf-8")
+            info = tarfile.TarInfo("var/log/containers/nova-compute.log")
+            info.size = len(payload)
+            archive.addfile(info, fileobj=__import__("io").BytesIO(payload))
+
+    def test_skips_byte_identical_archive_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            reports_dir = tmp_path / "SOS_REPORTS"
+            reports_dir.mkdir()
+            first = reports_dir / "report-a.tar.xz"
+            second = reports_dir / "report-b.tar.xz"
+            self._write_sample_archive(first, "spawn failed")
+            second.write_bytes(first.read_bytes())
+
+            db_path = tmp_path / "test.duckdb"
+            ingest_sos_reports(reports_dir=reports_dir, db_path=db_path, clear_existing=True)
+
+            import duckdb
+
+            with duckdb.connect(str(db_path)) as conn:
+                rows = conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0]
+                reports = conn.execute(
+                    "SELECT DISTINCT report_name FROM os_logs"
+                ).fetchall()
+                registry = conn.execute(
+                    "SELECT COUNT(*) FROM ingested_reports WHERE status = 'completed'"
+                ).fetchone()[0]
+            self.assertEqual(rows, 1)
+            self.assertEqual(len(reports), 1)
+            self.assertEqual(registry, 1)
+
+    def test_ingests_distinct_archives_sequentially(self) -> None:
+        """Distinct archives both land in DuckDB (phase2 sequential registry path)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            reports_dir = tmp_path / "SOS_REPORTS"
+            reports_dir.mkdir()
+            self._write_sample_archive(reports_dir / "host-a.tar.xz", "failure-a")
+            self._write_sample_archive(reports_dir / "host-b.tar.xz", "failure-b")
+
+            db_path = tmp_path / "test.duckdb"
+            ingest_sos_reports(
+                reports_dir=reports_dir,
+                db_path=db_path,
+                clear_existing=True,
+            )
+
+            import duckdb
+
+            with duckdb.connect(str(db_path)) as conn:
+                rows = conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0]
+                messages = {
+                    row[0]
+                    for row in conn.execute("SELECT message FROM os_logs").fetchall()
+                }
+                index_names = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'os_logs'"
+                    ).fetchall()
+                }
+            self.assertEqual(rows, 2)
+            self.assertTrue(any("failure-a" in msg for msg in messages))
+            self.assertTrue(any("failure-b" in msg for msg in messages))
+            self.assertIn("idx_os_logs_service_level_ts", index_names)

@@ -115,7 +115,41 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    ensure_indexes(conn)
 
+
+def ensure_indexes(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create investigation-friendly indexes (idempotent)."""
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_os_logs_service_level_ts
+        ON os_logs(service, level, timestamp)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_os_logs_timestamp
+        ON os_logs(timestamp)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_os_logs_report_name
+        ON os_logs(report_name)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_os_commands_service
+        ON os_commands(service)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_os_commands_report_name
+        ON os_commands(report_name)
+        """
+    )
 
 def archive_already_ingested(conn: duckdb.DuckDBPyConnection, archive_id: str) -> bool:
     row = conn.execute(

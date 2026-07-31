@@ -69,11 +69,15 @@ class DetectiveCoordinator:
 
 
 def investigate_prompt(db_path: str | Path, prompt: str) -> InvestigationReport:
-    return DetectiveCoordinator(db_path).investigate(prompt)
+    coordinator = DetectiveCoordinator(db_path)
+    try:
+        return coordinator.investigate(prompt)
+    finally:
+        coordinator.store.close()
 
 
 def investigate_prompt_offline(db_path: str | Path, prompt: str) -> InvestigationReport:
-    return DetectiveCoordinator(db_path).investigate(prompt)
+    return investigate_prompt(db_path, prompt)
 
 
 def _timeline_services(
