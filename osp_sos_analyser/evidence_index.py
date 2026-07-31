@@ -76,62 +76,144 @@ def extract_entity_ids(text: str) -> list[str]:
 
 def build_evidence_index(conn: Any, *, report_name: str | None = None) -> dict[str, int]:
     """Rebuild entities + entity_mentions from os_logs (and hosts from cluster_nodes)."""
+    import sys
+    import time
+
     if report_name:
         conn.execute("DELETE FROM entity_mentions WHERE report_name = ?", [report_name])
     else:
         conn.execute("DELETE FROM entity_mentions")
         conn.execute("DELETE FROM entities")
 
-    log_sql = """
+    # Full-table Python scans feel "hung" on large SOS DBs. Prefer rows that are
+    # likely RCA-relevant: errors/warnings or messages that look like they carry IDs.
+    where_bits = [
+        "message IS NOT NULL",
+        "length(message) > 0",
+        """(
+            upper(COALESCE(level, '')) IN ('ERROR', 'CRITICAL', 'WARNING', 'FATAL')
+            OR regexp_matches(message, '(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+            OR message ILIKE '%req-%'
+            OR message ILIKE '%instance%'
+            OR message ILIKE '%port_id%'
+            OR message ILIKE '%volume%'
+            OR message ILIKE '%uuid%'
+            OR service IN ('nova', 'neutron', 'cinder', 'ovn', 'glance', 'keystone')
+        )""",
+    ]
+    params: list[object] = []
+    if report_name:
+        where_bits.append("report_name = ?")
+        params.append(report_name)
+    where_sql = " AND ".join(where_bits)
+
+    total_logs = int(
+        conn.execute(f"SELECT COUNT(*) FROM os_logs WHERE {where_sql}", params).fetchone()[0]
+    )
+    print(
+        f"[progress] Evidence index: scanning {total_logs} candidate log row(s)",
+        flush=True,
+    )
+
+    entity_meta: dict[str, dict[str, Any]] = {}
+    mention_rows: list[tuple[object, ...]] = []
+    mentions_per_entity: dict[str, int] = {}
+    max_mentions_per_entity = 80
+    insert_batch_size = 2000
+    scanned = 0
+    started = time.perf_counter()
+
+    result = conn.execute(
+        f"""
         SELECT timestamp, level, service, message, source_file, report_name,
                COALESCE(hostname, '') AS hostname
         FROM os_logs
-    """
-    params: list[object] = []
-    if report_name:
-        log_sql += " WHERE report_name = ?"
-        params.append(report_name)
+        WHERE {where_sql}
+        """,
+        params,
+    )
 
-    rows = conn.execute(log_sql, params).fetchall()
-    entity_meta: dict[str, dict[str, Any]] = {}
-    mention_rows: list[tuple[object, ...]] = []
+    def _flush_mentions(force: bool = False) -> None:
+        nonlocal mention_rows
+        if not mention_rows:
+            return
+        if not force and len(mention_rows) < insert_batch_size:
+            return
+        conn.executemany(
+            """
+            INSERT INTO entity_mentions (
+                entity_id, entity_type, timestamp, hostname, service, level,
+                source_file, report_name, message_excerpt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            mention_rows,
+        )
+        mention_rows = []
 
-    for timestamp, level, service, message, source_file, report, hostname in rows:
-        text = str(message or "")
-        for entity_id in extract_entity_ids(text):
-            entity_type = classify_entity_type(entity_id, text, str(service or ""))
-            meta = entity_meta.setdefault(
-                entity_id,
-                {
-                    "entity_type": entity_type,
-                    "mention_count": 0,
-                    "first_seen": timestamp,
-                    "last_seen": timestamp,
-                },
-            )
-            if meta["entity_type"] == "unknown" and entity_type != "unknown":
-                meta["entity_type"] = entity_type
-            meta["mention_count"] += 1
-            if timestamp is not None:
-                if meta["first_seen"] is None or timestamp < meta["first_seen"]:
-                    meta["first_seen"] = timestamp
-                if meta["last_seen"] is None or timestamp > meta["last_seen"]:
-                    meta["last_seen"] = timestamp
-            mention_rows.append(
-                (
+    while True:
+        chunk = result.fetchmany(1000)
+        if not chunk:
+            break
+        for timestamp, level, service, message, source_file, report, hostname in chunk:
+            scanned += 1
+            text = str(message or "")
+            for entity_id in extract_entity_ids(text):
+                if mentions_per_entity.get(entity_id, 0) >= max_mentions_per_entity:
+                    # Still update aggregate counts/timestamps without storing more digests.
+                    meta = entity_meta.get(entity_id)
+                    if meta is not None:
+                        meta["mention_count"] += 1
+                        if timestamp is not None:
+                            if meta["first_seen"] is None or timestamp < meta["first_seen"]:
+                                meta["first_seen"] = timestamp
+                            if meta["last_seen"] is None or timestamp > meta["last_seen"]:
+                                meta["last_seen"] = timestamp
+                    continue
+                entity_type = classify_entity_type(entity_id, text, str(service or ""))
+                meta = entity_meta.setdefault(
                     entity_id,
-                    entity_type,
-                    timestamp,
-                    str(hostname or ""),
-                    str(service or ""),
-                    str(level or ""),
-                    str(source_file or ""),
-                    str(report or ""),
-                    truncate_text(text, DIGEST_MESSAGE_CHARS),
+                    {
+                        "entity_type": entity_type,
+                        "mention_count": 0,
+                        "first_seen": timestamp,
+                        "last_seen": timestamp,
+                    },
                 )
-            )
+                if meta["entity_type"] == "unknown" and entity_type != "unknown":
+                    meta["entity_type"] = entity_type
+                meta["mention_count"] += 1
+                if timestamp is not None:
+                    if meta["first_seen"] is None or timestamp < meta["first_seen"]:
+                        meta["first_seen"] = timestamp
+                    if meta["last_seen"] is None or timestamp > meta["last_seen"]:
+                        meta["last_seen"] = timestamp
+                mention_rows.append(
+                    (
+                        entity_id,
+                        entity_type,
+                        timestamp,
+                        str(hostname or ""),
+                        str(service or ""),
+                        str(level or ""),
+                        str(source_file or ""),
+                        str(report or ""),
+                        truncate_text(text, DIGEST_MESSAGE_CHARS),
+                    )
+                )
+                mentions_per_entity[entity_id] = mentions_per_entity.get(entity_id, 0) + 1
+            if scanned == 1 or scanned % 20000 == 0:
+                print(
+                    f"[progress] Evidence index: scanned {scanned}/{total_logs} row(s); "
+                    f"{len(entity_meta)} entit(y/ies)",
+                    flush=True,
+                )
+                _flush_mentions()
+        _flush_mentions()
+
+    _flush_mentions(force=True)
 
     # Register hosts as first-class entities.
+    host_mentions: list[tuple[object, ...]] = []
     for hostname, role, cluster_id in conn.execute(
         "SELECT hostname, node_role, cluster_id FROM cluster_nodes"
     ).fetchall():
@@ -149,7 +231,7 @@ def build_evidence_index(conn: Any, *, report_name: str | None = None) -> dict[s
         )
         meta["entity_type"] = "host"
         meta["mention_count"] = max(int(meta["mention_count"]), 1)
-        mention_rows.append(
+        host_mentions.append(
             (
                 entity_id,
                 "host",
@@ -162,10 +244,19 @@ def build_evidence_index(conn: Any, *, report_name: str | None = None) -> dict[s
                 f"Host {entity_id} role={role}",
             )
         )
+    if host_mentions:
+        conn.executemany(
+            """
+            INSERT INTO entity_mentions (
+                entity_id, entity_type, timestamp, hostname, service, level,
+                source_file, report_name, message_excerpt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            host_mentions,
+        )
 
     if report_name:
-        # Refresh aggregate entity rows touched by this report.
-        touched = sorted({row[0] for row in mention_rows})
+        touched = sorted(entity_meta)
         for entity_id in touched:
             conn.execute("DELETE FROM entities WHERE entity_id = ?", [entity_id])
     else:
@@ -181,28 +272,25 @@ def build_evidence_index(conn: Any, *, report_name: str | None = None) -> dict[s
         )
         for entity_id, meta in entity_meta.items()
     ]
-    if entity_rows:
+    for offset in range(0, len(entity_rows), insert_batch_size):
         conn.executemany(
             """
             INSERT INTO entities (
                 entity_id, entity_type, mention_count, first_seen, last_seen
             ) VALUES (?, ?, ?, ?, ?)
             """,
-            entity_rows,
-        )
-    if mention_rows:
-        conn.executemany(
-            """
-            INSERT INTO entity_mentions (
-                entity_id, entity_type, timestamp, hostname, service, level,
-                source_file, report_name, message_excerpt
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            mention_rows,
+            entity_rows[offset : offset + insert_batch_size],
         )
 
-    return {"entities": len(entity_rows), "mentions": len(mention_rows)}
-
+    mention_count = int(conn.execute("SELECT COUNT(*) FROM entity_mentions").fetchone()[0])
+    elapsed = time.perf_counter() - started
+    print(
+        f"[progress] Evidence index complete: {len(entity_rows)} entit(y/ies), "
+        f"{mention_count} mention(s) in {elapsed:.1f}s",
+        flush=True,
+    )
+    sys.stdout.flush()
+    return {"entities": len(entity_rows), "mentions": mention_count}
 
 def get_cluster_manifest(conn: Any) -> list[dict[str, Any]]:
     rows = conn.execute(

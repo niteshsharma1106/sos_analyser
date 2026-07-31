@@ -673,6 +673,13 @@ def ingest_sos_reports(
                 mark_archive_failed(conn, archive_id)
                 raise
 
+        log_total = int(conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0])
+        cmd_total = int(conn.execute("SELECT COUNT(*) FROM os_commands").fetchone()[0])
+        print(
+            f"[progress] Post-ingest indexing over {log_total} log row(s) and "
+            f"{cmd_total} command row(s) — this can take several minutes on large SOS DBs",
+            flush=True,
+        )
         index_stats = build_evidence_index(conn)
         print(
             "[progress] Evidence index: "

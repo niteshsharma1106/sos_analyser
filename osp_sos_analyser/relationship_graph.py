@@ -240,10 +240,8 @@ def relationship_candidates_from_message(
     """Deterministic relationship recipes for one log line."""
     grouped = extract_typed_entities(message, service)
     hosts = _match_hosts(message, aliases)
-    if hostname and hostname in aliases.values():
-        hosts.add(hostname)
-    elif hostname and hostname.lower() in aliases:
-        hosts.add(aliases[hostname.lower()])
+    # Do NOT auto-add the SOS report hostname into high-confidence host bindings.
+    # Observation-on-this-node edges are added separately at lower confidence.
     chassis_names = _match_chassis(message)
     excerpt = truncate_text(message, DIGEST_MESSAGE_CHARS)
     lowered = message.lower()
@@ -461,72 +459,111 @@ def relationship_candidates_from_message(
 
 def build_relationship_index(conn: Any) -> dict[str, int]:
     """Rebuild entity_relationships from os_logs + cluster host aliases."""
+    import sys
+    import time
+
     conn.execute("DELETE FROM entity_relationships")
     aliases = _known_host_aliases(conn)
-    rows = conn.execute(
-        """
-        SELECT timestamp, level, service, message, source_file, report_name,
-               COALESCE(hostname, '') AS hostname
-        FROM os_logs
-        """
-    ).fetchall()
+
+    where_sql = """
+        message IS NOT NULL
+        AND length(message) > 0
+        AND (
+            regexp_matches(message, '(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+            OR message ILIKE '%req-%'
+            OR message ILIKE '%chassis%'
+            OR message ILIKE '%binding:host%'
+            OR message ILIKE '%host_id%'
+            OR message ILIKE '%device_id%'
+            OR message ILIKE '%port_id%'
+            OR message ILIKE '%instance%'
+            OR message ILIKE '%volume%'
+        )
+    """
+    total_logs = int(conn.execute(f"SELECT COUNT(*) FROM os_logs WHERE {where_sql}").fetchone()[0])
+    print(
+        f"[progress] Relationship graph: scanning {total_logs} candidate log row(s)",
+        flush=True,
+    )
 
     edges: dict[tuple[str, str, str], dict[str, Any]] = {}
     chassis_entities: dict[str, dict[str, Any]] = {}
+    scanned = 0
+    started = time.perf_counter()
+    result = conn.execute(
+        f"""
+        SELECT timestamp, level, service, message, source_file, report_name,
+               COALESCE(hostname, '') AS hostname
+        FROM os_logs
+        WHERE {where_sql}
+        """
+    )
 
-    for timestamp, level, service, message, source_file, report_name, hostname in rows:
-        candidates = relationship_candidates_from_message(
-            message=str(message or ""),
-            service=str(service or ""),
-            hostname=str(hostname or ""),
-            aliases=aliases,
-            timestamp=timestamp,
-            level=str(level or ""),
-            source_file=str(source_file or ""),
-            report_name=str(report_name or ""),
-        )
-        for candidate in candidates:
-            key = _edge_key(
-                candidate["src_entity_id"],
-                candidate["relation_type"],
-                candidate["dst_entity_id"],
+    while True:
+        chunk = result.fetchmany(1000)
+        if not chunk:
+            break
+        for timestamp, level, service, message, source_file, report_name, hostname in chunk:
+            scanned += 1
+            candidates = relationship_candidates_from_message(
+                message=str(message or ""),
+                service=str(service or ""),
+                hostname=str(hostname or ""),
+                aliases=aliases,
+                timestamp=timestamp,
+                level=str(level or ""),
+                source_file=str(source_file or ""),
+                report_name=str(report_name or ""),
             )
-            existing = edges.get(key)
-            if existing is None:
-                edges[key] = candidate
-                continue
-            existing["evidence_count"] += int(candidate["evidence_count"])
-            existing["confidence"] = max(
-                float(existing["confidence"]), float(candidate["confidence"])
-            )
-            ts = candidate.get("first_seen")
-            if ts is not None:
-                if existing["first_seen"] is None or ts < existing["first_seen"]:
-                    existing["first_seen"] = ts
-                if existing["last_seen"] is None or ts > existing["last_seen"]:
-                    existing["last_seen"] = ts
-            existing["hostnames"] |= set(candidate.get("hostnames") or [])
-            existing["services"] |= set(candidate.get("services") or [])
+            for candidate in candidates:
+                key = _edge_key(
+                    candidate["src_entity_id"],
+                    candidate["relation_type"],
+                    candidate["dst_entity_id"],
+                )
+                existing = edges.get(key)
+                if existing is None:
+                    edges[key] = candidate
+                else:
+                    existing["evidence_count"] += int(candidate["evidence_count"])
+                    existing["confidence"] = max(
+                        float(existing["confidence"]), float(candidate["confidence"])
+                    )
+                    ts = candidate.get("first_seen")
+                    if ts is not None:
+                        if existing["first_seen"] is None or ts < existing["first_seen"]:
+                            existing["first_seen"] = ts
+                        if existing["last_seen"] is None or ts > existing["last_seen"]:
+                            existing["last_seen"] = ts
+                    existing["hostnames"] |= set(candidate.get("hostnames") or [])
+                    existing["services"] |= set(candidate.get("services") or [])
 
-            if candidate["dst_entity_type"] == "chassis":
-                chassis = candidate["dst_entity_id"]
-                meta = chassis_entities.setdefault(
-                    chassis,
-                    {"mention_count": 0, "first_seen": None, "last_seen": None},
+                ts = candidate.get("first_seen")
+                if candidate["dst_entity_type"] == "chassis":
+                    chassis = candidate["dst_entity_id"]
+                    meta = chassis_entities.setdefault(
+                        chassis,
+                        {"mention_count": 0, "first_seen": None, "last_seen": None},
+                    )
+                    meta["mention_count"] += 1
+                    if ts is not None:
+                        if meta["first_seen"] is None or ts < meta["first_seen"]:
+                            meta["first_seen"] = ts
+                        if meta["last_seen"] is None or ts > meta["last_seen"]:
+                            meta["last_seen"] = ts
+                if candidate["src_entity_type"] == "chassis":
+                    chassis = candidate["src_entity_id"]
+                    meta = chassis_entities.setdefault(
+                        chassis,
+                        {"mention_count": 0, "first_seen": None, "last_seen": None},
+                    )
+                    meta["mention_count"] += 1
+            if scanned == 1 or scanned % 20000 == 0:
+                print(
+                    f"[progress] Relationship graph: scanned {scanned}/{total_logs} row(s); "
+                    f"{len(edges)} edge(s)",
+                    flush=True,
                 )
-                meta["mention_count"] += 1
-                if ts is not None:
-                    if meta["first_seen"] is None or ts < meta["first_seen"]:
-                        meta["first_seen"] = ts
-                    if meta["last_seen"] is None or ts > meta["last_seen"]:
-                        meta["last_seen"] = ts
-            if candidate["src_entity_type"] == "chassis":
-                chassis = candidate["src_entity_id"]
-                meta = chassis_entities.setdefault(
-                    chassis,
-                    {"mention_count": 0, "first_seen": None, "last_seen": None},
-                )
-                meta["mention_count"] += 1
 
     relationship_rows = [
         (
@@ -550,7 +587,8 @@ def build_relationship_index(conn: Any) -> dict[str, int]:
         )
         for meta in edges.values()
     ]
-    if relationship_rows:
+    insert_batch_size = 1000
+    for offset in range(0, len(relationship_rows), insert_batch_size):
         conn.executemany(
             """
             INSERT INTO entity_relationships (
@@ -560,7 +598,7 @@ def build_relationship_index(conn: Any) -> dict[str, int]:
                 sample_level, sample_source_file, sample_report_name
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            relationship_rows,
+            relationship_rows[offset : offset + insert_batch_size],
         )
 
     for chassis, meta in chassis_entities.items():
@@ -584,8 +622,14 @@ def build_relationship_index(conn: Any) -> dict[str, int]:
             ],
         )
 
+    elapsed = time.perf_counter() - started
+    print(
+        f"[progress] Relationship graph complete: {len(relationship_rows)} edge(s), "
+        f"{len(chassis_entities)} chassis entit(y/ies) in {elapsed:.1f}s",
+        flush=True,
+    )
+    sys.stdout.flush()
     return {"relationships": len(relationship_rows), "chassis_entities": len(chassis_entities)}
-
 
 def _row_to_relationship(row: Sequence[Any]) -> EntityRelationship:
     return EntityRelationship(
@@ -688,7 +732,15 @@ def get_operation_path(
             continue
         for edge in sorted(
             adjacency.get(current, []),
-            key=lambda item: (-item.confidence, -item.evidence_count),
+            key=lambda item: (
+                -item.confidence,
+                -item.evidence_count,
+                # Prefer concrete binding/path relations over generic observation.
+                0
+                if item.relation_type in {"port_host", "instance_port", "port_chassis", "chassis_host"}
+                else 1,
+                item.relation_type,
+            ),
         ):
             nxt = (
                 edge.dst_entity_id.lower()
