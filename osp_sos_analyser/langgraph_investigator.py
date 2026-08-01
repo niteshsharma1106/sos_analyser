@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .context_pack import truncate_text
-from .investigation_tools import build_langchain_tools, prefetch_investigation_digest
+from .investigation_tools import build_langchain_tools, is_rebootish_query, prefetch_investigation_digest
 from .llm_client import MissingLLMConfiguration
 from .observability import (
     AgentObservabilityCallback,
@@ -60,31 +60,54 @@ INVESTIGATOR_SYSTEM_PROMPT = """
 You are an OpenStack RCA investigator.
 
 CRITICAL EXECUTION RULES:
-- Call tools ONE AT A TIME. Never emit multiple tool calls in the same step.
+- Call tools ONE AT A TIME via the native tool-calling API only.
+- Never write XML tags, <function=...>, or Python-style tool_name({...}) text.
 - Wait for each tool result before choosing the next tool.
+- Stay on the user question. Do not chase unrelated controller/OVN noise.
 
-Investigation order (mandatory):
-1) Call get_cluster_overview once to understand nodes/roles.
-2) If multiple nodes are present, call compare_nodes to see which hosts are noisy.
-3) If you have a UUID/req-id/hostname, call get_entity_evidence first.
-   Use hostname= for node-specific incidents. Prefer the FULL hostname from the manifest.
-   Short names like comp008 are OK; do not also force node_role= when hostname= is set.
-4) For host reboot / crash / panic / power questions (CRITICAL):
-   a) Call search_sos_commands with hostname= and command_pattern='dmesg,last,journalctl,uptime'
-      Leave search_terms empty first; only add terms after you have raw command output.
-   b) Call search_os_logs with hostname= and search_terms using OR, e.g.
-      'reboot OR panic OR watchdog OR oom-kill OR Hardware Error'.
-      Do NOT set service= for reboot/crash (leave service empty). Neutron/Nova filters hide kernel evidence.
-   Do not conclude "no evidence" until sos_commands were checked.
-5) Call get_related_entities and get_operation_path only for UUID-centric network/VM incidents.
-6) Extract related IDs from digests and query those with get_entity_evidence
-   (ports/networks -> neutron/ovn, volumes/images -> cinder/glance, instances -> nova).
-7) Use list_indexed_entities if you need candidates by type.
-8) Use search_os_logs as a fallback when the evidence/graph index has no hits.
+Investigation order:
+A) Host reboot / crash / panic / power / auto-reboot questions (HIGHEST PRIORITY):
+   1. Call get_host_reboot_timeline with the hostname first. Goal: establish WHEN
+      the compute last booted (who -b / last / uptime / dmesg / journalctl).
+   2. Only after a boot/reboot time candidate exists, call search_sos_commands and/or
+      search_os_logs on that hostname for panic/watchdog/oom-kill/Hardware Error/MCE
+      around that time. Leave service empty for these searches.
+   3. Do NOT call compare_nodes, get_related_entities, or get_operation_path for a
+      single-host reboot question unless the timeline proves a multi-node event.
+   4. Answer with: last boot time (if known) → likely cause → supporting evidence.
+
+B) Other incidents:
+   1) get_cluster_overview once if hostname/role is unclear.
+   2) get_entity_evidence for UUID/req-id/hostname.
+   3) compare_nodes only for multi-node noise questions.
+   4) get_related_entities / get_operation_path for UUID-centric network/VM paths.
+   5) search_os_logs / list_indexed_entities as fallbacks.
 
 Tool results are already digests. Do not paste them back in full.
 Stop once you can explain or rule out a root cause. End with a concise RCA.
 """
+
+# Groq Llama / gpt-oss models sometimes emit tool calls as
+# <function=name({...})></function> instead of structured tool_calls; the API
+# then 400s with tool_use_failed. We salvage name+args and continue.
+_GROQ_FUNCTION_TAG_RE = re.compile(
+    r"<function\s*=\s*([A-Za-z_][\w]*)\s*"
+    r"(?:"
+    r"\(\s*(\{.*\})\s*\)\s*(?:></function>|>)?"  # name({...})
+    r"|"
+    r">\s*(\{.*?\})\s*</function>"  # name>{"k":...}</function>
+    r"|"
+    r">\s*</function>"  # empty body
+    r"|"
+    r"\s+(\{.*?\})\s*(?:></function>|</function>)?"  # name {...}
+    r")",
+    re.DOTALL,
+)
+_GROQ_INLINE_TOOL_RE = re.compile(
+    r"attempted to call tool\s+'([A-Za-z_][\w]*)\((\{.*\})\)'",
+    re.DOTALL,
+)
+_MAX_GROQ_TOOL_RECOVERIES = 3
 
 
 def _clip_str(value: Any, max_len: int) -> Optional[str]:
@@ -454,6 +477,22 @@ def _normalize_provider(model_provider: str) -> str:
     return normalize_provider(model_provider)
 
 
+def _structured_expand_methods(model_provider: str | None = None) -> list[str]:
+    """
+    Prefer native json_schema when available; Groq often rejects it unless the
+    model is on their structured-output allow-list, so fall back to json_mode.
+    """
+    from .env_config import get_llm_settings
+
+    try:
+        provider = get_llm_settings(model_provider=model_provider).provider
+    except Exception:
+        provider = _normalize_provider(model_provider or "")
+    if provider == "groq":
+        return ["json_mode", "json_schema"]
+    return ["json_schema", "json_mode"]
+
+
 def _required_api_key(model_provider: str) -> str | None:
     from .env_config import api_key_env_for_provider
 
@@ -474,6 +513,151 @@ def _init_llm(model: str | None = None, model_provider: str | None = None):
     return llm
 
 
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    blob = (text or "").strip()
+    if not blob:
+        return None
+    start = blob.find("{")
+    end = blob.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(blob[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def parse_groq_failed_generation(text: str) -> tuple[str, dict[str, Any]] | None:
+    """
+    Parse Groq tool_use_failed ``failed_generation`` payloads.
+
+    Handles mangled forms such as::
+
+        <function=search_os_logs({"hostname": "comp008"})></function>
+        <function=search_os_logs>{"hostname": "comp008"}</function>
+    """
+    blob = (text or "").strip()
+    if not blob:
+        return None
+
+    match = _GROQ_FUNCTION_TAG_RE.search(blob)
+    if match:
+        name = match.group(1)
+        raw_args = match.group(2) or match.group(3) or match.group(4) or ""
+        args = _extract_json_object(raw_args) or {}
+        return name, args
+
+    # Some failures only include the mangled name in the error message.
+    match = _GROQ_INLINE_TOOL_RE.search(blob)
+    if match:
+        args = _extract_json_object(match.group(2)) or {}
+        return match.group(1), args
+
+    # JSON object shape: {"name": "...", "arguments": {...}}
+    data = _extract_json_object(blob)
+    if data and isinstance(data.get("name"), str):
+        raw = data.get("arguments", data.get("parameters", {}))
+        if isinstance(raw, str):
+            raw = _extract_json_object(raw) or {}
+        if isinstance(raw, dict):
+            return data["name"], raw
+    return None
+
+
+def extract_groq_failed_tool_call(exc: BaseException) -> tuple[str, dict[str, Any]] | None:
+    """Extract (tool_name, args) from a Groq BadRequestError / wrapper."""
+    candidates: list[str] = []
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") if isinstance(body.get("error"), dict) else body
+        if isinstance(err, dict):
+            failed = err.get("failed_generation")
+            if isinstance(failed, str) and failed.strip():
+                candidates.append(failed)
+            message = err.get("message")
+            if isinstance(message, str) and message.strip():
+                candidates.append(message)
+
+    # LangChain often wraps the provider error; walk the cause chain.
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current)
+        if text.strip():
+            candidates.append(text)
+        current = current.__cause__ or current.__context__
+
+    for candidate in candidates:
+        parsed = parse_groq_failed_generation(candidate)
+        if parsed:
+            return parsed
+        # Error message may embed the whole mangled call as the tool name.
+        inline = _GROQ_INLINE_TOOL_RE.search(candidate)
+        if inline:
+            args = _extract_json_object(inline.group(2)) or {}
+            return inline.group(1), args
+    return None
+
+
+def is_groq_tool_use_failed(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if "tool_use_failed" in text or "tool call validation failed" in text:
+        return True
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") if isinstance(body.get("error"), dict) else body
+        if isinstance(err, dict) and err.get("code") == "tool_use_failed":
+            return True
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, BaseException) and cause is not exc:
+        return is_groq_tool_use_failed(cause)
+    return False
+
+
+def invoke_tool_by_name(tools: list[Any], name: str, args: dict[str, Any] | None = None) -> str:
+    """Invoke a LangChain tool by name; returns a string digest or error text."""
+    args = args or {}
+    tool_map = {getattr(tool, "name", ""): tool for tool in tools}
+    tool = tool_map.get(name)
+    if tool is None:
+        available = ", ".join(sorted(k for k in tool_map if k)) or "(none)"
+        return f"Unknown tool {name!r}. Available: {available}"
+    try:
+        result = tool.invoke(args)
+    except Exception as tool_exc:  # noqa: BLE001 - surface to the agent loop
+        return f"Tool {name} failed: {type(tool_exc).__name__}: {tool_exc}"
+    return str(result)
+
+
+def _evidence_from_agent_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    """Collect tool digests from an agent message list."""
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    call_args: dict[str, dict[str, Any]] = {}
+    for message in messages:
+        if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
+            for tool_call in message.tool_calls:
+                call_args[tool_call["id"]] = tool_call.get("args", {}) or {}
+
+    gathered: list[dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, ToolMessage):
+            args = call_args.get(message.tool_call_id, {})
+            tool_name = message.name or "tool"
+            gathered.append(
+                {
+                    "service": args.get("service") or args.get("entity_type") or "index",
+                    "source": tool_name,
+                    "summary": str(args),
+                    "raw_logs": truncate_text(str(message.content), 1200),
+                }
+            )
+    return gathered
+
+
 def build_investigation_app(
     db_con,
     *,
@@ -485,7 +669,6 @@ def build_investigation_app(
     """Compile the expand → investigate → synthesize LangGraph app."""
     from langchain.agents import create_agent
     from langchain.agents.middleware import SummarizationMiddleware
-    from langchain_core.messages import AIMessage, ToolMessage
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.runnables import RunnableConfig, RunnablePassthrough
     from langgraph.graph import END, START, StateGraph
@@ -522,31 +705,46 @@ def build_investigation_app(
         run_trace.llm_start("query_expand")
         result: ExpandedQuery | None = None
         parse_error: str | None = None
-        try:
-            structured_llm = llm.with_structured_output(
-                ExpandedQuery, method="json_schema"
-            )
-            enrichment_chain = (
-                {"query": RunnablePassthrough()} | prompt_expand | structured_llm
-            )
-            result = enrichment_chain.invoke(
-                raw_query,
-                config=RunnableConfig(callbacks=[expand_cb.handler]),
-            )
-            result = sanitize_expanded_query(result, raw_query)
-        except Exception as exc:
-            parse_error = f"{type(exc).__name__}: {exc}"
+        last_exc: Exception | None = None
+        for method in _structured_expand_methods(model_provider):
+            try:
+                structured_llm = llm.with_structured_output(
+                    ExpandedQuery, method=method
+                )
+                enrichment_chain = (
+                    {"query": RunnablePassthrough()} | prompt_expand | structured_llm
+                )
+                result = enrichment_chain.invoke(
+                    raw_query,
+                    config=RunnableConfig(callbacks=[expand_cb.handler]),
+                )
+                result = sanitize_expanded_query(result, raw_query)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                log.warning(
+                    "Structured expand via %s failed (%s)",
+                    method,
+                    truncate_text(f"{type(exc).__name__}: {exc}", 180),
+                )
+                continue
+
+        if result is None and last_exc is not None:
+            parse_error = f"{type(last_exc).__name__}: {last_exc}"
             log.warning(
                 "Structured expand failed (%s); attempting salvage/fallback",
                 truncate_text(parse_error, 200),
             )
             # Prefer salvaging model text from the exception when available.
-            completion = getattr(exc, "llm_output", None) or getattr(exc, "completion", None)
+            completion = getattr(last_exc, "llm_output", None) or getattr(
+                last_exc, "completion", None
+            )
             if isinstance(completion, dict):
                 completion = completion.get("text") or completion.get("content")
             if not completion:
                 # LangChain OutputParserException often stores the raw text here.
-                completion = getattr(exc, "text", None) or str(exc)
+                completion = getattr(last_exc, "text", None) or str(last_exc)
             # Strip the leading "Failed to parse ..." wrapper if present.
             if isinstance(completion, str) and "from completion" in completion:
                 idx = completion.find("{")
@@ -608,58 +806,165 @@ def build_investigation_app(
         run_trace.node_start("INVESTIGATOR")
         plan = state["expanded_plan"]
         prefetch = state.get("prefetch_digest") or "No prefetched evidence."
-        user_message = (
-            "Investigate this RHOSP incident using Cluster Manifest + Evidence Index tools.\n\n"
+        hostname = getattr(getattr(plan, "entities", None), "hostname", None)
+        rebootish = is_rebootish_query(
+            " ".join(
+                [
+                    str(getattr(plan, "summary", "") or ""),
+                    str(getattr(getattr(plan, "entities", None), "problem", "") or ""),
+                    " ".join(getattr(plan, "keywords", []) or []),
+                    str(state.get("raw_query") or ""),
+                ]
+            )
+        )
+        if rebootish:
+            host_hint = hostname or "the compute hostname from the question"
+            mission = (
+                "REBOOT MISSION (follow exactly):\n"
+                f"1) Establish WHEN {host_hint} last rebooted/booted "
+                "(use get_host_reboot_timeline; who -b / last / uptime / dmesg).\n"
+                "2) Then investigate ONLY around that time for panic/watchdog/OOM/MCE/"
+                "Hardware Error on that host.\n"
+                "3) Ignore unrelated controller/OVN/nova WARNING noise unless it "
+                "clearly explains the reboot.\n"
+                "4) Final answer must state last boot time (or that it is unknown) "
+                "before the root-cause claim.\n"
+            )
+        else:
+            mission = (
+                "Investigate this RHOSP incident using Cluster Manifest + Evidence Index tools.\n"
+            )
+        base_user_message = (
+            f"{mission}\n"
             f"Incident: {plan.summary}\n"
             f"Known entities: {plan.entities.model_dump()}\n"
             f"Keywords: {plan.keywords}\n"
             f"Time window: {plan.time_window}\n\n"
-            f"Prefetched digest (already retrieved — build on it):\n{prefetch}\n"
+            f"Prefetched digest (already retrieved — build on it; for reboot questions "
+            f"the boot timeline is at the top):\n{prefetch}\n"
         )
         agent_cb = AgentObservabilityCallback(run_trace, stage="investigator")
-        result = investigator_agent.invoke(
-            {"messages": [("user", user_message)]},
-            config=RunnableConfig(callbacks=[agent_cb.handler]),
-        )
-        messages = result["messages"]
+        config = RunnableConfig(callbacks=[agent_cb.handler])
 
-        call_args: dict[str, dict[str, Any]] = {}
-        for message in messages:
-            if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
-                for tool_call in message.tool_calls:
-                    call_args[tool_call["id"]] = tool_call.get("args", {})
+        gathered_evidence: list[dict[str, Any]] = []
+        recovered_digests: list[str] = []
+        investigator_raw = ""
+        user_message = base_user_message
 
-        gathered_evidence = []
-        for message in messages:
-            if isinstance(message, ToolMessage):
-                args = call_args.get(message.tool_call_id, {})
-                tool_name = message.name or "tool"
-                output = str(message.content)
-                # Callbacks usually record tool events; keep a digest fallback.
-                if not any(
-                    event.kind == "tool_end" and tool_name in event.message
-                    for event in run_trace.events
+        for attempt in range(_MAX_GROQ_TOOL_RECOVERIES + 1):
+            last_messages: list[Any] = []
+            try:
+                # Stream so prior successful tool turns survive a late Groq 400.
+                for chunk in investigator_agent.stream(
+                    {"messages": [("user", user_message)]},
+                    config=config,
+                    stream_mode="values",
                 ):
-                    run_trace.tool_start(tool_name, args)
-                    run_trace.tool_end(tool_name, output)
+                    if isinstance(chunk, dict) and chunk.get("messages") is not None:
+                        last_messages = list(chunk.get("messages") or [])
+                gathered_from_agent = _evidence_from_agent_messages(last_messages)
+                # Keep manually recovered tool digests from earlier Groq failures.
+                if recovered_digests and gathered_evidence:
+                    existing = {
+                        (item.get("source"), item.get("summary"))
+                        for item in gathered_from_agent
+                    }
+                    merged = [
+                        item
+                        for item in gathered_evidence
+                        if (item.get("source"), item.get("summary")) not in existing
+                    ]
+                    gathered_evidence = merged + gathered_from_agent
+                else:
+                    gathered_evidence = gathered_from_agent
+                for item in gathered_evidence:
+                    tool_name = str(item.get("source") or "tool")
+                    if not any(
+                        event.kind == "tool_end" and tool_name in event.message
+                        for event in run_trace.events
+                    ):
+                        run_trace.tool_start(tool_name, {})
+                        run_trace.tool_end(tool_name, str(item.get("raw_logs") or ""))
+                if last_messages:
+                    investigator_raw = getattr(
+                        last_messages[-1], "content", last_messages[-1]
+                    )
+                break
+            except Exception as exc:
+                # Preserve any evidence collected before the failing LLM turn.
+                if last_messages:
+                    prior = _evidence_from_agent_messages(last_messages)
+                    if prior:
+                        # Keep recovered digests from earlier attempts, then add prior.
+                        existing_sources = {
+                            (item.get("source"), item.get("summary"))
+                            for item in gathered_evidence
+                        }
+                        for item in prior:
+                            key = (item.get("source"), item.get("summary"))
+                            if key not in existing_sources:
+                                gathered_evidence.append(item)
+
+                parsed = (
+                    extract_groq_failed_tool_call(exc)
+                    if is_groq_tool_use_failed(exc)
+                    else None
+                )
+                if parsed is None or attempt >= _MAX_GROQ_TOOL_RECOVERIES:
+                    if gathered_evidence or recovered_digests:
+                        run_trace.add(
+                            "tool_recovery_exhausted",
+                            "Continuing with recovered evidence after Groq tool_use_failed",
+                            details={"error": truncate_text(str(exc), 240)},
+                        )
+                        investigator_raw = (
+                            f"Investigator stopped after Groq tool-call error: "
+                            f"{truncate_text(str(exc), 300)}"
+                        )
+                        break
+                    raise
+
+                tool_name, tool_args = parsed
+                run_trace.add(
+                    "tool_recovery",
+                    f"Recovered mangled Groq tool call for {tool_name}",
+                    details={"args": tool_args, "attempt": attempt + 1},
+                )
+                run_trace.tool_start(tool_name, tool_args)
+                output = invoke_tool_by_name(tools, tool_name, tool_args)
+                run_trace.tool_end(tool_name, output)
                 gathered_evidence.append(
                     {
-                        "service": args.get("service") or args.get("entity_type") or "index",
+                        "service": tool_args.get("service")
+                        or tool_args.get("entity_type")
+                        or "index",
                         "source": tool_name,
-                        "summary": str(args),
+                        "summary": str(tool_args),
                         "raw_logs": truncate_text(output, 1200),
                     }
+                )
+                recovered_digests.append(
+                    f"[{tool_name}] args={tool_args}\n{truncate_text(output, 900)}"
+                )
+                user_message = (
+                    base_user_message
+                    + "\n\nAlready-executed tool results (do NOT repeat these exact calls):\n"
+                    + "\n\n".join(recovered_digests)
+                    + "\n\nContinue with other tools if needed, then conclude."
                 )
 
         run_trace.add(
             "investigator_summary",
             "Investigator finished tool loop",
-            details={"tool_results": len(gathered_evidence)},
+            details={
+                "tool_results": len(gathered_evidence),
+                "recoveries": len(recovered_digests),
+            },
         )
         run_trace.node_end("INVESTIGATOR", tools=len(gathered_evidence))
         return {
             "gathered_evidence": gathered_evidence,
-            "findings": {"investigator_raw": messages[-1].content},
+            "findings": {"investigator_raw": investigator_raw},
         }
 
     def synthesize_rca(state: InvestigationState) -> dict:
@@ -683,6 +988,9 @@ def build_investigation_app(
     {evidence_text}
 
     Write a concise root cause analysis. Cite hostnames and entity IDs when possible.
+    If this is a reboot/crash question: state the last boot/reboot time first (or say
+    it could not be determined), then explain the likely cause around that window.
+    Ignore unrelated controller/OVN warning noise unless it explains the reboot.
     If evidence is weak, say so and recommend next checks.
     """
         synth_cb = AgentObservabilityCallback(run_trace, stage="synthesize")
@@ -737,17 +1045,27 @@ def investigate_with_langgraph(
     extras: list[str] = []
     if focus_entity and focus_entity.strip():
         extras.append(f"Focused entity seed: {focus_entity.strip()}")
-    if include_graph:
+    rebootish = is_rebootish_query(enriched)
+    if include_graph and not rebootish:
         extras.append(
             "Prefer relationship graph tools (get_related_entities, get_operation_path) "
             "to map VM↔port↔chassis↔host."
         )
+    elif rebootish:
+        extras.append(
+            "Reboot question: first establish last boot time for the compute host, "
+            "then investigate cause around that timestamp. Do not use relationship-graph tools."
+        )
     style = (answer_style or "Concise RCA").strip()
     if style == "Evidence-heavy":
         extras.append("Answer style: evidence-heavy — cite more digests and hostnames.")
-    elif style == "Operation path first":
+    elif style == "Operation path first" and not rebootish:
         extras.append(
             "Answer style: start with the operation path (VM→port→chassis→host), then RCA."
+        )
+    elif rebootish:
+        extras.append(
+            "Answer style: start with last boot/reboot time, then root cause around that window."
         )
     else:
         extras.append("Answer style: concise RCA.")

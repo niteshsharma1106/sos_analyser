@@ -11,6 +11,7 @@ import duckdb
 from osp_sos_analyser.ingest import ingest_sos_reports
 from osp_sos_analyser.investigation_tools import (
     build_langchain_tools,
+    format_host_reboot_timeline,
     format_manifest,
     prefetch_investigation_digest,
 )
@@ -210,6 +211,17 @@ class InvestigationToolsTests(unittest.TestCase):
                     """,
                     [host],
                 )
+                conn.execute(
+                    """
+                    INSERT INTO os_commands (
+                        source, command, output, service, category, source_file,
+                        report_name, hostname, node_role
+                    ) VALUES ('sos', 'who -b', 'system boot  2026-07-26 21:05',
+                              'system', 'system', 'sos_commands/systemd/who_-b',
+                              'sos', ?, 'unknown')
+                    """,
+                    [host],
+                )
 
                 # Overlay should report compute even though DB says unknown.
                 self.assertIn("role=compute", format_manifest(conn))
@@ -221,16 +233,29 @@ class InvestigationToolsTests(unittest.TestCase):
                     [host],
                 )
 
+                timeline = format_host_reboot_timeline(conn, "comp008")
+                self.assertIn("Last reboot / boot timeline", timeline)
+                self.assertIn("2026-07-26 21:05", timeline)
+                self.assertIn("Likely boot/reboot timestamp candidates", timeline)
+
                 digest = prefetch_investigation_digest(
                     conn,
                     raw_query="why compute n1-wrkld1-b1-b12-comp008 rebooted?",
                     keywords=["reboot", "comp008"],
                 )
+                self.assertIn("Last reboot / boot timeline", digest)
                 self.assertIn("Focused host evidence", digest)
                 self.assertIn("kernel panic", digest.lower())
                 self.assertIn("dmesg", digest.lower())
+                # Reboot prefetch should not dump cross-node warning noise.
+                self.assertNotIn("Cross-node activity", digest)
 
                 tools = {tool.name: tool for tool in build_langchain_tools(conn)}
+                self.assertIn("get_host_reboot_timeline", tools)
+                tool_timeline = tools["get_host_reboot_timeline"].invoke(
+                    {"hostname": "comp008"}
+                )
+                self.assertIn("2026-07-26 21:05", tool_timeline)
                 logs = tools["search_os_logs"].invoke(
                     {
                         "hostname": "comp008",
@@ -272,3 +297,15 @@ class InvestigationToolsTests(unittest.TestCase):
                 )
                 self.assertIn("unfiltered command artifacts", cmds_loose)
                 self.assertIn("Kernel panic", cmds_loose)
+
+                # Narrow patterns with no hits should expand to the reboot set.
+                cmds_fallback = tools["search_sos_commands"].invoke(
+                    {
+                        "hostname": "comp008",
+                        "command_pattern": "this-pattern-does-not-exist",
+                        "search_terms": "",
+                        "limit": 5,
+                    }
+                )
+                self.assertIn("expanded to reboot command set", cmds_fallback)
+                self.assertIn("dmesg", cmds_fallback.lower())

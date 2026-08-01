@@ -14,7 +14,11 @@ from osp_sos_analyser.langgraph_investigator import (
     _init_llm,
     _normalize_node_role,
     _parse_partial_expanded_json,
+    extract_groq_failed_tool_call,
     fallback_expanded_query,
+    invoke_tool_by_name,
+    is_groq_tool_use_failed,
+    parse_groq_failed_generation,
     render_investigation_result,
     sanitize_expanded_query,
 )
@@ -248,3 +252,71 @@ class ExpandedQueryHardeningTests(unittest.TestCase):
         # Either salvaged from partial JSON or heuristic fallback.
         self.assertIn(plan.entities.node_role, {None, "compute"})
         self.assertTrue(plan.keywords or plan.summary)
+
+
+class GroqToolCallRecoveryTests(unittest.TestCase):
+    def test_parse_function_tag_with_inline_args(self) -> None:
+        failed = (
+            '<function=search_os_logs({"hostname": "n1-wrkld1-b1-b12-comp008", '
+            '"limit": 15, "search_terms": "reboot OR panic OR watchdog OR '
+            'oom-kill OR Hardware Error"})></function>'
+        )
+        parsed = parse_groq_failed_generation(failed)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        name, args = parsed
+        self.assertEqual(name, "search_os_logs")
+        self.assertEqual(args["hostname"], "n1-wrkld1-b1-b12-comp008")
+        self.assertEqual(args["limit"], 15)
+        self.assertIn("reboot", args["search_terms"])
+
+    def test_parse_function_tag_with_body_args(self) -> None:
+        failed = '<function=search_sos_commands>{"hostname": "comp008"}</function>'
+        parsed = parse_groq_failed_generation(failed)
+        self.assertEqual(parsed, ("search_sos_commands", {"hostname": "comp008"}))
+
+    def test_extract_from_bad_request_shaped_error(self) -> None:
+        class _FakeGroqError(Exception):
+            def __init__(self) -> None:
+                super().__init__(
+                    "Error code: 400 - {'error': {'message': "
+                    "\"tool call validation failed: attempted to call tool "
+                    "'search_os_logs({\\\"hostname\\\": \\\"comp008\\\"})' "
+                    "which was not in request.tools\", "
+                    "'type': 'invalid_request_error', 'code': 'tool_use_failed', "
+                    "'failed_generation': "
+                    "'<function=search_os_logs({\\\"hostname\\\": \\\"comp008\\\"})>"
+                    "</function>'}}"
+                )
+                self.body = {
+                    "error": {
+                        "message": (
+                            "tool call validation failed: attempted to call tool "
+                            "'search_os_logs({\"hostname\": \"comp008\"})' "
+                            "which was not in request.tools"
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "tool_use_failed",
+                        "failed_generation": (
+                            '<function=search_os_logs({"hostname": "comp008"})>'
+                            "</function>"
+                        ),
+                    }
+                }
+
+        exc = _FakeGroqError()
+        self.assertTrue(is_groq_tool_use_failed(exc))
+        parsed = extract_groq_failed_tool_call(exc)
+        self.assertEqual(parsed, ("search_os_logs", {"hostname": "comp008"}))
+
+    def test_invoke_tool_by_name(self) -> None:
+        class _Tool:
+            name = "search_os_logs"
+
+            def invoke(self, args: dict) -> str:
+                return f"ok:{args.get('hostname')}"
+
+        out = invoke_tool_by_name([_Tool()], "search_os_logs", {"hostname": "comp008"})
+        self.assertEqual(out, "ok:comp008")
+        missing = invoke_tool_by_name([_Tool()], "nope", {})
+        self.assertIn("Unknown tool", missing)

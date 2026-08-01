@@ -7,11 +7,56 @@ from unittest.mock import patch
 
 import duckdb
 
-from osp_sos_analyser.chat_ui import _answer_question, build_chat_app
+from osp_sos_analyser.chat_ui import _answer_question, _normalize_chat_text, build_chat_app
 from osp_sos_analyser.db import ensure_schema
 
 
 class ChatUiTests(unittest.TestCase):
+    def test_normalize_chat_text_multimodal_blocks(self) -> None:
+        self.assertEqual(
+            _normalize_chat_text(
+                [{"text": "what compute comp008 auto rebooted?", "type": "text"}]
+            ),
+            "what compute comp008 auto rebooted?",
+        )
+        self.assertEqual(
+            _normalize_chat_text(
+                "[{'text': 'what compute comp008 auto rebooted?', 'type': 'text'}]"
+            ),
+            "what compute comp008 auto rebooted?",
+        )
+        self.assertEqual(
+            _normalize_chat_text({"content": "plain question"}),
+            "plain question",
+        )
+
+    def test_answer_question_strips_multimodal_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "sos.duckdb")
+            conn = duckdb.connect(db_path)
+            try:
+                ensure_schema(conn)
+            finally:
+                conn.close()
+
+            with patch(
+                "osp_sos_analyser.chat_ui.investigate_prompt_offline"
+            ) as offline_fn:
+
+                class _Report:
+                    def render_markdown(self) -> str:
+                        return "# Offline answer"
+
+                offline_fn.return_value = _Report()
+                text = _answer_question(
+                    [{"text": "Port binding failed", "type": "text"}],
+                    [],
+                    db_path,
+                    True,
+                    "",
+                )
+                self.assertEqual(text, "# Offline answer")
+                self.assertEqual(offline_fn.call_args.kwargs["prompt"], "Port binding failed")
     def test_missing_db_returns_guidance(self) -> None:
         text = _answer_question(
             "Why did compute-03 lose network?",

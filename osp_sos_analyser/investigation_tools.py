@@ -53,6 +53,154 @@ REBOOT_COMMAND_PATTERNS = (
     "mcelog",
     "crash",
 )
+# Prefer these when establishing *when* a host last booted.
+BOOT_TIME_COMMAND_PATTERNS = (
+    "who_-b",
+    "last",
+    "uptime",
+    "dmesg",
+    "journalctl",
+)
+_BOOT_HINT_RE = re.compile(
+    r"(?im)^.*(?:"
+    r"system boot|"
+    r"reboot\s+system|"
+    r"wtmp begins|"
+    r"Linux version|"
+    r"-- Boot |"
+    r"Startup finished|"
+    r"Reached target (?:Multi-User|Graphical|Basic)|"
+    r"Command line:|"
+    r"Kernel panic|"
+    r"watchdog:|"
+    r"systemd-shutdown|"
+    r"Stopped target|"
+    r"Starting Power-Off"
+    r").*$"
+)
+_BOOT_DATETIME_RE = re.compile(
+    r"(?:"
+    r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?"
+    r"|"
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+    r"\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?\s+20\d{2}"
+    r"|"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+    r"\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s+20\d{2})?"
+    r")"
+)
+_REBOOTISH_QUERY_RE = re.compile(
+    r"\b(reboot|rebooted|crash|panic|oom|shutdown|power[\s-]?off|watchdog|auto[\s-]?reboot)\b",
+    re.I,
+)
+
+
+def is_rebootish_query(text: str) -> bool:
+    return bool(_REBOOTISH_QUERY_RE.search(text or ""))
+
+
+def _extract_boot_hint_lines(output: str, *, limit: int = 8) -> list[str]:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for match in _BOOT_HINT_RE.finditer(output or ""):
+        line = " ".join(match.group(0).split())
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        lines.append(truncate_text(line, 220))
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def format_host_reboot_timeline(
+    conn: Any,
+    hostname: str,
+    *,
+    limit: int = 12,
+) -> str:
+    """
+    Deterministic first step for reboot RCA: establish when the host last booted
+    from sos_commands (who -b / last / uptime / dmesg / journalctl).
+    """
+    hint = (hostname or "").strip()
+    if not hint:
+        return "hostname is required to build a reboot timeline."
+    hosts = resolve_hostnames(conn, hint)
+    if not hosts:
+        return f"No cluster hostname matched {hint!r}."
+
+    host = hosts[0]
+    notes: list[str] = []
+    if host.lower() != hint.lower():
+        notes.append(f"resolved hostname {hint!r} → {host}")
+
+    rows = search_commands_by_node(
+        conn,
+        hostnames=[host],
+        command_patterns=list(BOOT_TIME_COMMAND_PATTERNS),
+        search_terms="",
+        limit=max(1, min(int(limit), 20)),
+    )
+    if not rows:
+        rows = search_commands_by_node(
+            conn,
+            hostnames=[host],
+            command_patterns=list(REBOOT_COMMAND_PATTERNS),
+            search_terms="",
+            limit=max(1, min(int(limit), 20)),
+        )
+        if rows:
+            notes.append("boot-time patterns empty; used broader reboot command set")
+
+    boot_times: list[str] = []
+    evidence_blocks: list[str] = []
+    for row in rows:
+        command = str(row.get("command") or row.get("source_file") or "command")
+        output = str(row.get("output") or "")
+        hints = _extract_boot_hint_lines(output, limit=6)
+        if not hints and not any(
+            key in command.lower() or key in str(row.get("source_file") or "").lower()
+            for key in ("who_-b", "who -b", "last", "uptime")
+        ):
+            continue
+        # For last/who -b/uptime, always show a short head even without regex hits.
+        if not hints:
+            head = truncate_text(output.strip() or "(empty output)", 400)
+            hints = [line.strip() for line in head.splitlines() if line.strip()][:6]
+        for line in hints:
+            for dt in _BOOT_DATETIME_RE.findall(line):
+                token = dt.strip()
+                if token and token not in boot_times:
+                    boot_times.append(token)
+        evidence_blocks.append(
+            f"{host}|{command}|{row.get('source_file') or '-'}\n"
+            + "\n".join(f"  {line}" for line in hints[:6])
+        )
+
+    lines = [f"## Last reboot / boot timeline for {host}"]
+    if notes:
+        lines.extend(f"({n})" for n in notes)
+    if boot_times:
+        lines.append(f"Likely boot/reboot timestamp candidates: {', '.join(boot_times[:5])}")
+        lines.append(
+            "Next: investigate logs/commands in a window around the newest candidate "
+            "(panic/watchdog/OOM/MCE/Hardware Error just before that time)."
+        )
+    else:
+        lines.append(
+            "No clear boot timestamp extracted yet. Inspect who -b / last / uptime / "
+            "dmesg / journalctl output below, then search logs around that time."
+        )
+    if evidence_blocks:
+        lines.append("")
+        lines.append("Boot-related sos_commands excerpts:")
+        lines.extend(evidence_blocks[:8])
+    else:
+        lines.append("")
+        lines.append(format_command_rows(rows) if rows else "No sos_commands artifacts matched.")
+    return "\n".join(lines)
 
 
 def format_manifest(conn: Any) -> str:
@@ -261,31 +409,29 @@ def prefetch_investigation_digest(
     limit_per_entity: int = 12,
 ) -> str:
     """Build a compact digest from manifest + evidence index for the investigator."""
-    sections = ["## Cluster manifest", format_manifest(conn)]
+    sections: list[str] = []
+
+    focus_hosts = hostnames_mentioned_in_text(conn, raw_query)
+    rebootish = is_rebootish_query(raw_query)
+
+    # Reboot questions: establish WHEN the host last booted BEFORE other noise.
+    if rebootish and focus_hosts:
+        timeline_blocks = [
+            format_host_reboot_timeline(conn, host, limit=12) for host in focus_hosts[:3]
+        ]
+        sections.append("\n\n".join(timeline_blocks))
+
+    sections.append("## Cluster manifest\n" + format_manifest(conn))
 
     nodes = get_cluster_manifest(conn)
-    if len(nodes) > 1:
+    # Skip noisy cross-node WARNING dumps for single-host reboot questions.
+    if len(nodes) > 1 and not rebootish:
         comparison = compare_node_activity(conn, limit=40)
         sections.append("## Cross-node activity\n" + format_node_comparison(comparison))
 
-    focus_hosts = hostnames_mentioned_in_text(conn, raw_query)
-    rebootish = bool(
-        re.search(
-            r"\b(reboot|rebooted|crash|panic|oom|shutdown|power[\s-]?off|watchdog)\b",
-            raw_query or "",
-            re.I,
-        )
-    )
     if focus_hosts:
         host_blocks: list[str] = []
         for host in focus_hosts[:3]:
-            activity = get_host_activity(
-                conn,
-                host,
-                levels=("CRITICAL", "ERROR", "WARNING"),
-                limit=limit_per_entity,
-            )
-            block = f"### Host {host}\n" + format_evidence_mentions(activity)
             if rebootish:
                 reboot_logs = search_logs_by_node(
                     conn,
@@ -293,16 +439,27 @@ def prefetch_investigation_digest(
                     search_terms=" OR ".join(REBOOT_LOG_TERMS[:10]),
                     limit=limit_per_entity,
                 )
-                block += "\n\nReboot/crash log hits:\n" + format_node_log_rows(reboot_logs)
                 cmds = search_commands_by_node(
                     conn,
                     hostnames=[host],
                     command_patterns=REBOOT_COMMAND_PATTERNS,
                     limit=8,
                 )
-                block += "\n\nHost sos_commands (dmesg/last/journal):\n" + format_command_rows(
-                    cmds
+                block = (
+                    f"### Host {host} reboot/crash evidence\n"
+                    + "Reboot/crash log hits:\n"
+                    + format_node_log_rows(reboot_logs)
+                    + "\n\nHost sos_commands (dmesg/last/journal):\n"
+                    + format_command_rows(cmds)
                 )
+            else:
+                activity = get_host_activity(
+                    conn,
+                    host,
+                    levels=("CRITICAL", "ERROR", "WARNING"),
+                    limit=limit_per_entity,
+                )
+                block = f"### Host {host}\n" + format_evidence_mentions(activity)
             host_blocks.append(block)
         sections.append("## Focused host evidence\n" + "\n\n".join(host_blocks))
 
@@ -365,6 +522,23 @@ def build_langchain_tools(conn: Any):
         """Return the Cluster Manifest: hostnames, roles, RHOSP version, and services per SOS node."""
         with db_lock:
             return format_manifest(conn)
+
+    @tool
+    def get_host_reboot_timeline(
+        hostname: str,
+        limit: int = 12,
+    ) -> str:
+        """
+        FIRST tool for reboot/crash questions. Establish when the host last booted
+        from who -b / last / uptime / dmesg / journalctl. Pass hostname (short or FQDN).
+        Do this before compare_nodes or generic log searches.
+        """
+        with db_lock:
+            return format_host_reboot_timeline(
+                conn,
+                hostname,
+                limit=max(1, min(int(limit), 20)),
+            )
 
     @tool
     def compare_nodes(
@@ -571,16 +745,18 @@ def build_langchain_tools(conn: Any):
         """
         Search sos_commands outputs (dmesg, last, journalctl, uptime, ipmitool, ...).
         Critical for host reboot/crash RCA. Hostname may be short (comp008).
-        Prefer command_pattern='dmesg,last,journalctl' with empty search_terms first.
+        Prefer leaving command_pattern empty to search the full reboot artifact set,
+        or pass a comma list such as dmesg,last,journalctl,uptime,ipmitool.
         """
         with db_lock:
             capped = max(1, min(int(limit), 20))
             hostnames = resolve_hostnames(conn, hostname) if hostname.strip() else ()
-            patterns = (
+            requested = (
                 [p.strip() for p in re.split(r"[,\s]+", command_pattern) if p.strip()]
                 if command_pattern.strip()
-                else list(REBOOT_COMMAND_PATTERNS)
+                else []
             )
+            patterns = requested or list(REBOOT_COMMAND_PATTERNS)
             rows = search_commands_by_node(
                 conn,
                 hostnames=hostnames,
@@ -588,22 +764,50 @@ def build_langchain_tools(conn: Any):
                 search_terms=search_terms,
                 limit=capped,
             )
+            notes: list[str] = []
+            # Narrow patterns like dmesg,last,journalctl often miss RHOSP archives
+            # that only ship ipmitool/uptime — fall back to the full reboot set.
+            if (
+                not rows
+                and requested
+                and set(p.lower() for p in requested)
+                != set(p.lower() for p in REBOOT_COMMAND_PATTERNS)
+            ):
+                rows = search_commands_by_node(
+                    conn,
+                    hostnames=hostnames,
+                    command_patterns=list(REBOOT_COMMAND_PATTERNS),
+                    search_terms=search_terms,
+                    limit=capped,
+                )
+                if rows:
+                    notes.append(
+                        "no hits for command_pattern="
+                        f"{command_pattern!r}; expanded to reboot command set"
+                    )
             # If term filter was too strict, return the raw command artifacts.
             if not rows and search_terms.strip():
                 rows = search_commands_by_node(
                     conn,
                     hostnames=hostnames,
-                    command_patterns=patterns,
+                    command_patterns=patterns
+                    if not notes
+                    else list(REBOOT_COMMAND_PATTERNS),
                     search_terms="",
                     limit=capped,
                 )
-                note = "(no output matched search_terms; showing unfiltered command artifacts)\n"
-            else:
-                note = ""
-            if hostname.strip() and hostnames and hostnames[0].lower() != hostname.strip().lower():
-                note = (
-                    f"(resolved hostname {hostname!r} → {', '.join(hostnames)})\n" + note
+                notes.append(
+                    "no output matched search_terms; showing unfiltered command artifacts"
                 )
+            if (
+                hostname.strip()
+                and hostnames
+                and hostnames[0].lower() != hostname.strip().lower()
+            ):
+                notes.insert(
+                    0, f"resolved hostname {hostname!r} → {', '.join(hostnames)}"
+                )
+            note = ("\n".join(f"({n})" for n in notes) + "\n") if notes else ""
             return note + format_command_rows(rows)
 
     @tool
@@ -664,6 +868,7 @@ def build_langchain_tools(conn: Any):
             return format_operation_path(path, start_entity_id=start)
 
     return [
+        get_host_reboot_timeline,
         get_cluster_overview,
         compare_nodes,
         get_entity_evidence,

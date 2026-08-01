@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
@@ -35,92 +36,226 @@ DEFAULT_EXAMPLES = [
 ]
 
 CHAT_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Sora:wght@400;500;600&display=swap');
-
 :root {
-  --osp-ink: #15202b;
-  --osp-muted: #5b6b7c;
-  --osp-accent: #0f766e;
-  --osp-accent-soft: #ccfbf1;
-  --osp-user: #134e4a;
-  --osp-panel: rgba(255, 255, 255, 0.78);
-  --osp-line: rgba(21, 32, 43, 0.08);
-  --osp-shadow: 0 18px 50px rgba(15, 35, 45, 0.08);
+  --osp-ink: #101820;
+  --osp-ink-soft: #243040;
+  --osp-muted: #667788;
+  --osp-accent: #1f6f8b;
+  --osp-accent-deep: #155a72;
+  --osp-accent-wash: rgba(31, 111, 139, 0.12);
+  --osp-accent-line: rgba(31, 111, 139, 0.28);
+  --osp-user-bg: #e7f2f7;
+  --osp-user-text: #101820;
+  --osp-surface: #ffffff;
+  --osp-line: rgba(16, 24, 32, 0.10);
+  --osp-shadow: 0 10px 28px rgba(16, 32, 48, 0.07);
+  --osp-radius: 0.85rem;
+  --osp-col: min(1120px, calc(100vw - 2rem));
+}
+
+html, body {
+  height: 100% !important;
+  margin: 0 !important;
+  overflow: hidden !important;
 }
 
 .gradio-container {
-  font-family: "Sora", sans-serif !important;
+  font-family: "Outfit", sans-serif !important;
   max-width: 100% !important;
+  width: 100% !important;
   margin: 0 !important;
   padding: 0 !important;
-  min-height: 100vh;
+  min-height: 100vh !important;
+  height: 100vh !important;
   color: var(--osp-ink);
-  background:
-    radial-gradient(1200px 600px at 12% -10%, rgba(15, 118, 110, 0.16), transparent 55%),
-    radial-gradient(900px 500px at 90% 0%, rgba(56, 119, 160, 0.12), transparent 50%),
-    linear-gradient(180deg, #eef3f6 0%, #f7f9fb 42%, #eef2f5 100%) !important;
+  background-color: #edf1f4 !important;
+  background-image:
+    radial-gradient(ellipse 90% 55% at 8% -8%, rgba(31, 111, 139, 0.18), transparent 58%),
+    radial-gradient(ellipse 70% 45% at 96% 4%, rgba(23, 50, 74, 0.10), transparent 52%),
+    linear-gradient(165deg, #f5f7f9 0%, #e8eef2 48%, #e3e9ee 100%) !important;
+  overflow: hidden !important;
 }
 
+/* Kill Gradio's default content max-width so the shell can center one column. */
 .gradio-container .main,
-.gradio-container .wrap {
-  max-width: 920px !important;
-  margin-left: auto !important;
-  margin-right: auto !important;
+.gradio-container .wrap,
+.gradio-container .contain,
+.gradio-container .fillable,
+.gradio-container [data-testid="block-container"],
+.gradio-container .columns,
+.gradio-container .row {
+  max-width: none !important;
+}
+
+.gradio-container > .main,
+.gradio-container .main,
+.gradio-container .wrap,
+.gradio-container .contain,
+.gradio-container [data-testid="block-container"] {
+  width: 100% !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  height: 100% !important;
+}
+
+.gradio-container .gap {
+  gap: 0.65rem !important;
 }
 
 #osp-shell {
-  min-height: 100vh;
-  padding: 1.25rem 1rem 1.5rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
+  box-sizing: border-box !important;
+  width: var(--osp-col) !important;
+  max-width: var(--osp-col) !important;
+  margin: 0 auto !important;
+  height: 100vh !important;
+  min-height: 100vh !important;
+  padding: 1rem 0 0.85rem !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: stretch !important;
+  justify-content: flex-start !important;
+  gap: 0.65rem !important;
+}
+
+#osp-shell.column,
+div#osp-shell {
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+/* One shared column width for every section. */
+#osp-shell > *,
+#osp-shell > div,
+#osp-shell .block,
+#osp-shell .form,
+#osp-shell .group,
+#osp-shell .row,
+#osp-shell .column,
+#osp-shell .svelte-1ed2p3z {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  box-sizing: border-box !important;
+  align-self: stretch !important;
+}
+
+#osp-shell > * {
+  flex-shrink: 0;
 }
 
 #osp-brand {
-  text-align: center;
-  padding: 0.35rem 0.5rem 0.15rem;
-  animation: osp-rise 520ms ease-out both;
+  flex: 0 0 auto;
+  text-align: left;
+  padding: 0;
+  background: transparent !important;
+  animation: osp-rise 480ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+#osp-brand,
+#osp-brand .block,
+#osp-brand .html-container,
+#osp-brand .prose,
+#osp-brand p,
+#osp-brand span,
+#osp-brand div {
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+
+#osp-brand .osp-brand-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
 }
 
 #osp-brand .osp-mark {
-  font-family: "Fraunces", Georgia, serif;
+  font-family: "Bricolage Grotesque", sans-serif;
   font-weight: 700;
-  font-size: clamp(2rem, 4vw, 2.75rem);
-  letter-spacing: -0.03em;
-  line-height: 1.05;
-  color: var(--osp-ink);
+  font-size: clamp(1.9rem, 3.4vw, 2.55rem);
+  letter-spacing: -0.045em;
+  line-height: 0.95;
+  color: var(--osp-ink) !important;
   margin: 0;
+  animation: osp-mark-in 700ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 #osp-brand .osp-mark span {
-  color: var(--osp-accent);
+  color: var(--osp-accent) !important;
+  display: inline-block;
 }
 
 #osp-brand .osp-sub {
-  margin: 0.45rem auto 0;
-  max-width: 34rem;
-  color: var(--osp-muted);
-  font-size: 0.95rem;
+  margin: 0.45rem 0 0;
+  max-width: 40rem;
+  color: var(--osp-muted) !important;
+  font-size: 0.94rem;
   line-height: 1.45;
+  font-weight: 400;
 }
 
 #osp-brand .osp-cluster {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  margin-top: 0.7rem;
-  color: var(--osp-accent);
-  font-size: 0.78rem;
+  margin: 0;
+  color: var(--osp-accent-deep) !important;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.7rem;
   font-weight: 500;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  animation: osp-fade 900ms ease both;
 }
 
 #osp-chat {
-  flex: 1 1 auto;
-  border: none !important;
-  background: transparent !important;
+  flex: 1 1 0% !important;
+  flex-shrink: 1 !important;
+  min-height: 0 !important;
+  height: auto !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  border: 1px solid var(--osp-line) !important;
+  background: #ffffff !important;
+  border-radius: var(--osp-radius) !important;
   box-shadow: none !important;
-  animation: osp-rise 640ms ease-out both;
+  overflow: hidden !important;
+  overflow-x: hidden !important;
+  padding: 0 !important;
+  animation: osp-rise 620ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+#osp-chat,
+#osp-chat > .wrapper,
+#osp-chat > div,
+#osp-chat .bubble-wrap,
+#osp-chat [class*="scroll"],
+#osp-chat .chatbot,
+#osp-chat .block {
+  width: 100% !important;
+  max-width: 100% !important;
+  height: 100% !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  box-sizing: border-box !important;
+  overflow-x: hidden !important;
+}
+
+/* Kill Gradio/Soft gray “selected text” style on chat content. */
+#osp-chat p,
+#osp-chat span,
+#osp-chat code,
+#osp-chat pre,
+#osp-chat li,
+#osp-chat strong,
+#osp-chat em,
+#osp-chat a,
+#osp-chat .md,
+#osp-chat .prose,
+#osp-chat .prose * {
+  background: transparent !important;
+  background-color: transparent !important;
 }
 
 #osp-chat .bot,
@@ -129,49 +264,101 @@ CHAT_CSS = """
 #osp-chat .message.bot,
 #osp-chat .message-row.bot .message,
 #osp-chat .bubble.bot,
-#osp-chat .prose {
+#osp-chat .prose,
+#osp-chat [data-testid="bot"],
+#osp-chat .message-row.role-assistant .message,
+#osp-chat .message-row.role-assistant .bubble {
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
-  color: var(--osp-ink) !important;
-  font-size: 0.95rem !important;
-  line-height: 1.55 !important;
+  color: var(--osp-ink-soft) !important;
+  font-size: 0.96rem !important;
+  line-height: 1.6 !important;
+  max-width: 100% !important;
 }
 
+#osp-chat .message-row,
+#osp-chat .bubble-row {
+  width: 100% !important;
+  max-width: 100% !important;
+  padding-left: 0.85rem !important;
+  padding-right: 0.85rem !important;
+}
+
+/* Light user bubble — never near-black. */
 #osp-chat .user,
 #osp-chat [class*="user"] .message,
 #osp-chat .message.user,
 #osp-chat .message-row.user .message,
-#osp-chat .bubble.user {
-  background: var(--osp-user) !important;
-  color: #f8fffc !important;
-  border: none !important;
-  border-radius: 1.15rem 1.15rem 0.35rem 1.15rem !important;
-  box-shadow: 0 10px 24px rgba(19, 78, 74, 0.18) !important;
+#osp-chat .bubble.user,
+#osp-chat [data-testid="user"],
+#osp-chat .message-row.role-user .message,
+#osp-chat .message-row.role-user .bubble,
+#osp-chat .message-row.role-user [class*="message"] {
+  background: var(--osp-user-bg) !important;
+  background-color: var(--osp-user-bg) !important;
+  color: var(--osp-user-text) !important;
+  border: 1px solid var(--osp-accent-line) !important;
+  border-radius: 1rem 1rem 0.3rem 1rem !important;
+  box-shadow: none !important;
   padding: 0.75rem 1rem !important;
+  max-width: min(36rem, 90%) !important;
+}
+
+#osp-chat .user *,
+#osp-chat .bubble.user *,
+#osp-chat .message.user *,
+#osp-chat .message-row.role-user * {
+  color: var(--osp-user-text) !important;
+  background: transparent !important;
+  background-color: transparent !important;
 }
 
 #osp-composer-wrap {
-  position: sticky;
-  bottom: 0.4rem;
+  flex: 0 0 auto;
+  position: relative;
   z-index: 20;
-  padding: 0.35rem;
-  border-radius: 1.35rem;
-  background: var(--osp-panel);
+  padding: 0.3rem 0.35rem 0.3rem 0.45rem;
+  border-radius: var(--osp-radius);
+  background: var(--osp-surface) !important;
   border: 1px solid var(--osp-line);
   box-shadow: var(--osp-shadow);
-  backdrop-filter: blur(14px);
-  animation: osp-rise 720ms ease-out both;
+  animation: osp-rise 760ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  transition: border-color 180ms ease, box-shadow 180ms ease;
+}
+
+#osp-composer-wrap:focus-within {
+  border-color: var(--osp-accent-line);
+  box-shadow: 0 14px 36px rgba(31, 111, 139, 0.12);
+}
+
+#osp-composer-wrap .row,
+#osp-composer-wrap > div {
+  width: 100% !important;
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap !important;
+  align-items: center !important;
+  gap: 0.4rem !important;
+}
+
+#osp-composer {
+  flex: 1 1 auto !important;
+  order: 1 !important;
+  width: auto !important;
+  min-width: 0 !important;
+  background: transparent !important;
 }
 
 #osp-composer textarea {
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
-  font-family: "Sora", sans-serif !important;
-  font-size: 0.98rem !important;
+  font-family: "Outfit", sans-serif !important;
+  font-size: 1rem !important;
   color: var(--osp-ink) !important;
-  padding: 0.85rem 1rem !important;
+  padding: 0.75rem 0.85rem !important;
+  width: 100% !important;
 }
 
 #osp-composer textarea:focus {
@@ -179,56 +366,97 @@ CHAT_CSS = """
   box-shadow: none !important;
 }
 
+#osp-composer textarea::placeholder {
+  color: var(--osp-muted) !important;
+  opacity: 0.85;
+}
+
 #osp-send {
-  min-width: 3rem !important;
-  max-width: 3.4rem !important;
-  height: 3rem !important;
-  border-radius: 999px !important;
+  order: 2 !important;
+  min-width: 2.85rem !important;
+  max-width: 3.1rem !important;
+  width: 2.85rem !important;
+  height: 2.85rem !important;
+  border-radius: 0.65rem !important;
   background: var(--osp-accent) !important;
   border: none !important;
-  color: white !important;
+  color: #f7fbff !important;
   font-weight: 600 !important;
-  box-shadow: 0 8px 18px rgba(15, 118, 110, 0.28) !important;
-  transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease !important;
+  font-size: 1.05rem !important;
+  box-shadow: none !important;
+  transition: transform 150ms ease, background 150ms ease !important;
+  flex: 0 0 auto !important;
 }
 
 #osp-send:hover {
-  background: #0d9488 !important;
+  background: var(--osp-accent-deep) !important;
   transform: translateY(-1px);
-  box-shadow: 0 12px 22px rgba(15, 118, 110, 0.34) !important;
 }
 
 #osp-suggestions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  justify-content: center;
-  padding: 0.15rem 0.25rem 0.35rem;
+  flex: 0 0 auto;
+  display: flex !important;
+  flex-wrap: wrap !important;
+  gap: 0.45rem !important;
+  justify-content: flex-start !important;
+  align-items: center !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  width: 100% !important;
+  background: transparent !important;
 }
 
-#osp-suggestions button {
-  border-radius: 999px !important;
+#osp-suggestions button,
+#osp-suggestions button * {
+  border-radius: 0.55rem !important;
   border: 1px solid var(--osp-line) !important;
-  background: rgba(255, 255, 255, 0.72) !important;
-  color: var(--osp-ink) !important;
-  font-size: 0.78rem !important;
+  background: #ffffff !important;
+  background-color: #ffffff !important;
+  color: var(--osp-ink-soft) !important;
+  font-family: "Outfit", sans-serif !important;
+  font-size: 0.8rem !important;
   font-weight: 500 !important;
-  padding: 0.45rem 0.85rem !important;
+  padding: 0.42rem 0.75rem !important;
   box-shadow: none !important;
-  transition: background 160ms ease, border-color 160ms ease, transform 160ms ease !important;
+  margin: 0 !important;
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease !important;
 }
 
-#osp-suggestions button:hover {
-  background: var(--osp-accent-soft) !important;
-  border-color: rgba(15, 118, 110, 0.28) !important;
-  transform: translateY(-1px);
+#osp-suggestions button * {
+  border: none !important;
+  padding: 0 !important;
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+#osp-suggestions button:hover,
+#osp-suggestions button:hover * {
+  background: var(--osp-accent-wash) !important;
+  background-color: var(--osp-accent-wash) !important;
+  border-color: var(--osp-accent-line) !important;
+  color: var(--osp-accent-deep) !important;
+}
+
+#osp-suggestions button:hover * {
+  border: none !important;
+  background: transparent !important;
+  background-color: transparent !important;
 }
 
 #osp-settings {
+  flex: 0 0 auto;
   border: 1px solid var(--osp-line) !important;
-  background: rgba(255, 255, 255, 0.55) !important;
-  border-radius: 1rem !important;
+  background: rgba(255, 255, 255, 0.42) !important;
+  border-radius: var(--osp-radius) !important;
   overflow: hidden;
+  margin-top: 0 !important;
+}
+
+#osp-settings .label-wrap span,
+#osp-settings label span {
+  font-family: "Outfit", sans-serif !important;
+  font-weight: 500 !important;
+  color: var(--osp-ink-soft) !important;
 }
 
 footer, .footer {
@@ -236,14 +464,28 @@ footer, .footer {
 }
 
 @keyframes osp-rise {
-  from { opacity: 0; transform: translateY(10px); }
+  from { opacity: 0; transform: translateY(12px); }
   to { opacity: 1; transform: translateY(0); }
 }
 
+@keyframes osp-mark-in {
+  from { opacity: 0; letter-spacing: 0.04em; transform: translateY(8px); }
+  to { opacity: 1; letter-spacing: -0.045em; transform: translateY(0); }
+}
+
+@keyframes osp-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 @media (max-width: 720px) {
-  #osp-shell { padding: 0.85rem 0.65rem 1rem; }
-  #osp-brand .osp-mark { font-size: 1.8rem; }
-  #osp-composer-wrap { border-radius: 1.1rem; }
+  :root { --osp-col: calc(100vw - 1.2rem); }
+  #osp-shell { padding: 0.75rem 0 0.7rem !important; gap: 0.55rem !important; }
+  #osp-brand .osp-mark { font-size: 1.75rem; }
+  #osp-brand .osp-cluster { white-space: normal; }
+  html, body, .gradio-container { overflow: auto !important; height: auto !important; min-height: 100vh !important; }
+  #osp-shell { height: auto !important; min-height: 100vh !important; }
+  #osp-chat { min-height: 52vh !important; }
 }
 """
 
@@ -271,9 +513,11 @@ def _brand_html(cluster_line: str = "") -> str:
         cluster = f'<div class="osp-cluster">{cluster_line}</div>'
     return f"""
     <div id="osp-brand">
-      <p class="osp-mark">OSP <span>SOS</span></p>
-      <p class="osp-sub">Ask anything about your ingested OpenStack SOS reports — hosts, ports, reboots, and cross-node failures.</p>
-      {cluster}
+      <div class="osp-brand-row">
+        <p class="osp-mark">OSP <span>SOS</span></p>
+        {cluster}
+      </div>
+      <p class="osp-sub">Investigate OpenStack SOS reports — reboots, ports, and cross-node failures.</p>
     </div>
     """
 
@@ -296,6 +540,38 @@ def _offline_graph_digest(db_path: str, focus_entity: str) -> str:
     return "\n\n".join(parts)
 
 
+def _normalize_chat_text(message: Any) -> str:
+    """Extract plain text from Gradio chatbot content (str or multimodal blocks)."""
+    if message is None:
+        return ""
+    if isinstance(message, str):
+        text = message.strip()
+        # Gradio sometimes stringifies multimodal blocks into the history.
+        if text.startswith("[{") and "'text'" in text and "'type'" in text:
+            try:
+                import ast
+
+                parsed = ast.literal_eval(text)
+            except (SyntaxError, ValueError):
+                return text
+            return _normalize_chat_text(parsed)
+        return text
+    if isinstance(message, dict):
+        if "text" in message:
+            return _normalize_chat_text(message.get("text"))
+        if "content" in message:
+            return _normalize_chat_text(message.get("content"))
+        return str(message.get("text") or message.get("content") or "").strip()
+    if isinstance(message, (list, tuple)):
+        parts: list[str] = []
+        for item in message:
+            part = _normalize_chat_text(item)
+            if part:
+                parts.append(part)
+        return "\n".join(parts).strip()
+    return str(message).strip()
+
+
 def _answer_question(
     message: str,
     history: list,
@@ -308,7 +584,7 @@ def _answer_question(
     show_observability: bool = True,
 ) -> str:
     log = get_logger("chat")
-    prompt = (message or "").strip()
+    prompt = _normalize_chat_text(message)
     if not prompt:
         return "Ask an OpenStack / SOS investigation question to begin."
 
@@ -362,6 +638,13 @@ def _answer_question(
         )
     except Exception as exc:  # noqa: BLE001 - surface runtime errors in the chat UI
         log.exception("Chat investigation failed")
+        text = str(exc)
+        if "being used by another process" in text or "Cannot open file" in text:
+            return (
+                "Database is locked by another process (often a running ingest).\n\n"
+                "Wait for ingest to finish, or stop the other process, then ask again.\n\n"
+                f"Details: `{type(exc).__name__}: {exc}`"
+            )
         return f"Investigation failed: `{type(exc).__name__}: {exc}`"
 
 
@@ -382,55 +665,69 @@ def build_chat_app(
     llm_status = describe_llm_settings()
 
     theme = gr.themes.Soft(
-        primary_hue="teal",
+        primary_hue="slate",
         secondary_hue="slate",
         neutral_hue="slate",
-        font=gr.themes.GoogleFont("Sora"),
+        font=gr.themes.GoogleFont("Outfit"),
         font_mono=gr.themes.GoogleFont("IBM Plex Mono"),
         text_size=gr.themes.sizes.text_md,
-        radius_size=gr.themes.sizes.radius_lg,
+        radius_size=gr.themes.sizes.radius_md,
     ).set(
-        body_background_fill="#f7f9fb",
-        body_text_color="#15202b",
-        block_background_fill="rgba(255,255,255,0.55)",
+        body_background_fill="#edf1f4",
+        body_text_color="#101820",
+        block_background_fill="#ffffff",
         block_border_width="0px",
         block_shadow="none",
-        border_color_primary="rgba(21,32,43,0.08)",
-        button_primary_background_fill="#0f766e",
-        button_primary_background_fill_hover="#0d9488",
-        button_primary_text_color="#ffffff",
-        input_background_fill="rgba(255,255,255,0.9)",
+        border_color_primary="rgba(16,24,32,0.10)",
+        button_primary_background_fill="#1f6f8b",
+        button_primary_background_fill_hover="#155a72",
+        button_primary_text_color="#f7fbff",
+        button_secondary_background_fill="#ffffff",
+        button_secondary_text_color="#243040",
+        input_background_fill="#ffffff",
+        background_fill_primary="#ffffff",
+        background_fill_secondary="#edf1f4",
     )
 
     with gr.Blocks(
         title="OSP SOS",
         analytics_enabled=False,
         fill_height=True,
+        fill_width=True,
     ) as app:
-        with gr.Column(elem_id="osp-shell"):
+        with gr.Column(elem_id="osp-shell", elem_classes=["osp-shell"], scale=1, min_width=320):
             gr.HTML(_brand_html(banner))
 
             chatbot = gr.Chatbot(
                 elem_id="osp-chat",
                 show_label=False,
-                height="62vh",
-                resizable=True,
+                container=False,
+                value=[
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "## Start an investigation\n"
+                            "Ask about a host, VM, port, reboot, or an error in your SOS reports. "
+                            "Use a quick prompt below to get started."
+                        ),
+                    }
+                ],
+                height="100%",
+                resizable=False,
                 render_markdown=True,
                 layout="bubble",
-                placeholder=(
-                    "<strong>Start an investigation</strong><br/>"
-                    "Ask about a host reboot, port bind failure, or cross-node error pattern."
-                ),
+                placeholder=None,
                 buttons=["copy"],
+                scale=1,
             )
 
             suggestion_buttons = []
             suggestion_prompts = DEFAULT_EXAMPLES[:4]
             suggestion_labels = [
-                "Network loss on compute",
+                "Compute network loss",
                 "Port bind path",
                 "Host for VM/port",
-                "NoValidHost create fail",
+                "NoValidHost fail",
             ]
             with gr.Row(elem_id="osp-suggestions"):
                 for label in suggestion_labels:
@@ -441,14 +738,14 @@ def build_chat_app(
                     msg = gr.Textbox(
                         elem_id="osp-composer",
                         show_label=False,
-                        placeholder="Message OSP SOS…",
+                        placeholder="Ask about a reboot, port, or host…",
                         lines=1,
                         max_lines=6,
                         scale=8,
                         autofocus=True,
                         container=False,
                     )
-                    send = gr.Button("↑", elem_id="osp-send", scale=0)
+                    send = gr.Button("→", elem_id="osp-send", scale=1, min_width=48)
 
             with gr.Accordion("Settings", open=False, elem_id="osp-settings"):
                 gr.Markdown(
@@ -485,7 +782,7 @@ def build_chat_app(
                 )
 
         def _user_step(message: str, history: list):
-            text = (message or "").strip()
+            text = _normalize_chat_text(message)
             history = list(history or [])
             if not text:
                 return "", history
@@ -507,9 +804,9 @@ def build_chat_app(
                 return history
             last = history[-1]
             if isinstance(last, dict):
-                prompt = str(last.get("content") or "")
+                prompt = _normalize_chat_text(last.get("content"))
             else:
-                prompt = str(last[0] if last else "")
+                prompt = _normalize_chat_text(last[0] if last else "")
             answer = _answer_question(
                 prompt,
                 history,
@@ -608,6 +905,7 @@ def launch_chat(
         share=share,
         theme=getattr(app, "_osp_theme", None),
         css=getattr(app, "_osp_css", CHAT_CSS),
+        inbrowser=False,
     )
 
 
