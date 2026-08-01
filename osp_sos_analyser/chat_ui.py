@@ -17,6 +17,7 @@ from .langgraph_investigator import (
 )
 from .llm_client import MissingLLMConfiguration
 from .observability import configure_logging, get_logger
+from .privacy import redact_sensitive_text
 from .relationship_graph import (
     format_operation_path,
     format_relationships,
@@ -604,7 +605,7 @@ def _answer_question(
         include_graph,
         answer_style,
         focus_entity or "-",
-        prompt[:160],
+        redact_sensitive_text(prompt)[:160],
     )
 
     try:

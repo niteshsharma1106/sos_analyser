@@ -8,6 +8,7 @@ from pathlib import Path
 from osp_sos_analyser.langgraph_investigator import render_investigation_result
 from osp_sos_analyser.observability import (
     AgentRunTrace,
+    close_logging,
     configure_logging,
     get_logger,
 )
@@ -35,12 +36,15 @@ class ObservabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "osp_sos.log"
             configure_logging(level="INFO", log_file=str(log_path), force=True)
-            logger = get_logger("test")
-            logger.info("hello observability")
-            for handler in logging.getLogger("osp_sos").handlers:
-                handler.flush()
-            text = log_path.read_text(encoding="utf-8")
-            self.assertIn("hello observability", text)
+            try:
+                logger = get_logger("test")
+                logger.info("hello observability")
+                for handler in logging.getLogger("osp_sos").handlers:
+                    handler.flush()
+                text = log_path.read_text(encoding="utf-8")
+                self.assertIn("hello observability", text)
+            finally:
+                close_logging()
 
     def test_render_investigation_includes_trace(self) -> None:
         trace = AgentRunTrace(run_id="run-obs-1", prompt="test")

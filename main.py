@@ -15,6 +15,7 @@ from osp_sos_analyser.langgraph_investigator import (
 )
 from osp_sos_analyser.chat_ui import launch_chat
 from osp_sos_analyser.observability import configure_logging, get_logger
+from osp_sos_analyser.privacy import redact_sensitive_text
 from pydantic import BaseModel, Field
 
 
@@ -160,8 +161,9 @@ def main() -> None:
             print(report.render_markdown())
         else:
             try:
-                log.info("Analyze prompt=%s", args.prompt)
-                print(f"User Prompt: {args.prompt}")
+                safe_prompt = redact_sensitive_text(args.prompt)
+                log.info("Analyze prompt=%s", safe_prompt)
+                print(f"User Prompt: {safe_prompt}")
                 result = investigate_with_langgraph(
                     db_path=args.db_path,
                     prompt=args.prompt,

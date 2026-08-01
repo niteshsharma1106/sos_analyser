@@ -75,15 +75,25 @@ def extract_entity_ids(text: str) -> list[str]:
 
 
 def build_evidence_index(conn: Any, *, report_name: str | None = None) -> dict[str, int]:
-    """Rebuild entities + entity_mentions from os_logs (and hosts from cluster_nodes)."""
+    """Rebuild the complete entities + entity_mentions index.
+
+    ``entities`` contains aggregate counts across the full cluster, so a
+    per-report rebuild cannot be correct without recomputing every affected
+    aggregate. Preserve the optional argument for API compatibility but always
+    rebuild the coherent global index.
+    """
     import sys
     import time
 
     if report_name:
-        conn.execute("DELETE FROM entity_mentions WHERE report_name = ?", [report_name])
-    else:
-        conn.execute("DELETE FROM entity_mentions")
-        conn.execute("DELETE FROM entities")
+        print(
+            "[progress] Evidence index: report-scoped rebuild requested; "
+            "rebuilding global aggregates for correctness",
+            flush=True,
+        )
+    report_name = None
+    conn.execute("DELETE FROM entity_mentions")
+    conn.execute("DELETE FROM entities")
 
     # Full-table Python scans feel "hung" on large SOS DBs. Prefer rows that are
     # likely RCA-relevant: errors/warnings or messages that look like they carry IDs.
@@ -294,13 +304,6 @@ def build_evidence_index(conn: Any, *, report_name: str | None = None) -> dict[s
             """,
             host_mentions,
         )
-
-    if report_name:
-        touched = sorted(entity_meta)
-        for entity_id in touched:
-            conn.execute("DELETE FROM entities WHERE entity_id = ?", [entity_id])
-    else:
-        conn.execute("DELETE FROM entities")
 
     entity_rows = [
         (

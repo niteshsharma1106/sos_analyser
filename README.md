@@ -153,7 +153,7 @@ uv run osp-sos-chat --db-path sos_analysis.duckdb
 
 Open the printed local URL (default `http://127.0.0.1:7860`). Use **Offline mode** in Investigation settings for deterministic answers without an LLM.
 
-## Current capabilities
+## Implemented capabilities
 
 - Reads multiple .tar.xz SOS archives directly
 - Scans RHOSP 17 container log locations for Nova, Cinder, Neutron, OVN, and OVS
@@ -162,23 +162,25 @@ Open the printed local URL (default `http://127.0.0.1:7860`). Use **Offline mode
 - Captures SOS command-output artifacts into os_commands
 - Uses bulk DuckDB loading for faster ingestion
 - Skips already-ingested archives through the ingested_reports registry table
-- Verifies the ingestion path with automated tests
+- Builds an evidence index and VM/port/chassis/host relationship graph
+- Provides deterministic offline investigation and an LLM-backed LangGraph RCA workflow
+- Includes a local Gradio chat interface and automated test coverage
 
-## Phase 2 Plan: Multi-Agent Detective
+## Investigation workflow
 
-Phase 2 adds a LangChain multi-agent investigation layer on top of the DuckDB data created in Phase 1.
+The application includes a LangGraph investigation layer on top of the DuckDB data created during ingestion.
 
-The default implementation is a LangChain tool-calling Coordinator Agent. It reads the user query, decides which specialist tools to call, chooses search terms from the actual incident context, queries DuckDB, and generates an evidence-backed RCA. A deterministic `--offline` fallback remains available only for local testing without API keys.
+The default implementation is a LangChain tool-calling coordinator. It reads the user query, selects evidence tools, queries DuckDB, and produces an evidence-backed RCA. A deterministic `--offline` mode is also available when no LLM credentials are configured.
 
-The goal is to let a user ask an operational question such as:
+For example, ask an operational question such as:
 
 ```text
 VMs on compute-03 suddenly lost network connectivity at 14:00.
 ```
 
-The system should understand the problem, identify the likely services involved, dispatch specialist agents, gather evidence from the indexed SOS data, and return a structured root-cause analysis.
+The workflow identifies likely services and entities, gathers indexed SOS evidence, and returns a structured root-cause analysis.
 
-### Implemented architecture
+### Runtime architecture
 
 ```text
 User prompt or pasted logs
@@ -257,11 +259,11 @@ System/Podman Agent responsibilities:
 - identify restarted, failed, or unhealthy service containers
 - provide host and service inventory context
 
-### LangChain Tools
+### Investigation tools
 
-Phase 2 includes Python query helpers over DuckDB. LangChain exposes them as tools instead of letting the model write arbitrary SQL directly.
+LangChain exposes restricted DuckDB query helpers as tools instead of allowing arbitrary SQL from the model.
 
-Recommended tool modules:
+Core modules:
 
 ```text
 analysis.py          shared DuckDB query helpers
@@ -269,7 +271,7 @@ nova_tools.py        Nova-focused investigation tools
 network_tools.py     Neutron, OVN, and OVS tools
 cinder_tools.py      Cinder-focused investigation tools
 system_tools.py      Podman, systemctl, and host-state tools
-detective_graph.py   LangGraph coordinator and specialist workflow
+langgraph_investigator.py LangGraph investigation workflow
 ```
 
 Current implemented modules:
@@ -309,9 +311,9 @@ The final answer should be structured and evidence-backed:
 - Confidence level
 - Recommended next checks
 
-### Phase 2 implementation status
+### Current implementation status
 
-Completed:
+Implemented:
 
 1. Deterministic DuckDB query helpers in analysis.py.
 2. LangChain tool wrappers for Nova, Neutron/OVN, Cinder, System/Podman, timeline, and error summary.
@@ -321,9 +323,4 @@ Completed:
 6. Markdown RCA report generator.
 7. Automated tests for the detective workflow.
 
-Remaining future enhancements:
-
-1. Add richer pasted-log block classification.
-2. Add precise time-window filtering for prompts that include timestamps.
-3. Add request ID, instance ID, port ID, and volume ID deep-correlation flows.
-4. Add optional LangGraph orchestration if we need explicit graph state, retries, or human approval checkpoints.
+Planned enhancements should be tracked separately from this README so the documented workflow always reflects what users can run today.

@@ -18,6 +18,7 @@ from .observability import (
     configure_logging,
     get_logger,
 )
+from .privacy import redact_sensitive_text
 
 
 EXPAND_SYSTEM_PROMPT = """You are a query enrichment agent for a Red Hat OpenStack investigation workflow.
@@ -1041,7 +1042,7 @@ def investigate_with_langgraph(
     configure_logging()
     log = get_logger("investigator")
 
-    enriched = (prompt or "").strip()
+    enriched = redact_sensitive_text((prompt or "").strip())
     extras: list[str] = []
     if focus_entity and focus_entity.strip():
         extras.append(f"Focused entity seed: {focus_entity.strip()}")
@@ -1074,7 +1075,7 @@ def investigate_with_langgraph(
 
     run_trace = trace or AgentRunTrace(prompt=enriched)
     run_trace.add("run_start", "Starting LangGraph investigation", details={"db_path": str(db_path)})
-    log.info("Investigation start run=%s prompt=%s", run_trace.run_id[:8], truncate_text(prompt, 120))
+    log.info("Investigation start run=%s prompt=%s", run_trace.run_id[:8], truncate_text(enriched, 120))
 
     try:
         with DatabaseConnector(db_path, read_only=True) as db:

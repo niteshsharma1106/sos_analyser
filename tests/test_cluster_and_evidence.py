@@ -22,10 +22,38 @@ from osp_sos_analyser.evidence_index import (
     get_evidence,
     get_entity,
 )
+from osp_sos_analyser.db import ensure_schema
 from osp_sos_analyser.ingest import ingest_sos_reports
 
 
 class ClusterManifestAndEvidenceIndexTests(unittest.TestCase):
+    def test_report_scoped_rebuild_preserves_global_entity_counts(self) -> None:
+        entity_id = "11111111-1111-1111-1111-111111111111"
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "evidence.duckdb"
+            conn = duckdb.connect(str(db_path))
+            try:
+                ensure_schema(conn)
+                conn.executemany(
+                    """
+                    INSERT INTO os_logs (
+                        timestamp, level, message, service, source_file, report_name, hostname
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("2026-01-01 00:00:00", "ERROR", f"port {entity_id} failed", "neutron", "a.log", "a.tar.xz", "host-a"),
+                        ("2026-01-02 00:00:00", "ERROR", f"port {entity_id} failed", "neutron", "b.log", "b.tar.xz", "host-b"),
+                    ],
+                )
+                build_evidence_index(conn)
+                build_evidence_index(conn, report_name="a.tar.xz")
+                count = conn.execute(
+                    "SELECT mention_count FROM entities WHERE entity_id = ?", [entity_id]
+                ).fetchone()[0]
+                self.assertEqual(count, 2)
+            finally:
+                conn.close()
+
     def test_hostname_and_role_guesses(self) -> None:
         self.assertEqual(
             guess_hostname_from_archive_name("sosreport-compute-03-2026-07-09.tar.xz"),

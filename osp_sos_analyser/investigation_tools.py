@@ -19,6 +19,7 @@ from .evidence_index import (
     search_logs_by_node,
 )
 from .models import LogRecord
+from .privacy import redact_sensitive_text
 from .relationship_graph import (
     format_operation_path,
     format_relationships,
@@ -512,6 +513,11 @@ def build_langchain_tools(conn: Any):
     from langchain_core.tools import tool
 
     db_lock = threading.RLock()
+
+    def _safe_tool_output(value: object) -> str:
+        """Tool results are model-visible; never return common credentials."""
+        return redact_sensitive_text(value)
+
     reboot_term_re = re.compile(
         r"\b(reboot|panic|watchdog|oom|shutdown|mce|hardware error|kernel)\b",
         re.I,
@@ -521,7 +527,7 @@ def build_langchain_tools(conn: Any):
     def get_cluster_overview() -> str:
         """Return the Cluster Manifest: hostnames, roles, RHOSP version, and services per SOS node."""
         with db_lock:
-            return format_manifest(conn)
+            return _safe_tool_output(format_manifest(conn))
 
     @tool
     def get_host_reboot_timeline(
@@ -534,10 +540,12 @@ def build_langchain_tools(conn: Any):
         Do this before compare_nodes or generic log searches.
         """
         with db_lock:
-            return format_host_reboot_timeline(
-                conn,
-                hostname,
-                limit=max(1, min(int(limit), 20)),
+            return _safe_tool_output(
+                format_host_reboot_timeline(
+                    conn,
+                    hostname,
+                    limit=max(1, min(int(limit), 20)),
+                )
             )
 
     @tool
@@ -565,7 +573,7 @@ def build_langchain_tools(conn: Any):
                 levels=levels,
                 limit=capped,
             )
-            return format_node_comparison(rows)
+            return _safe_tool_output(format_node_comparison(rows))
 
     @tool
     def get_entity_evidence(
@@ -641,7 +649,7 @@ def build_langchain_tools(conn: Any):
                         empty="No recent WARNING/ERROR/INFO host logs for that hostname.",
                     )
                 )
-            return header + body
+            return _safe_tool_output(header + body)
 
     @tool
     def list_indexed_entities(entity_type: str = "", limit: int = 20) -> str:
@@ -658,9 +666,11 @@ def build_langchain_tools(conn: Any):
             )
             if not rows:
                 return "No entities in the evidence index. Re-ingest SOS reports first."
-            return "\n".join(
-                f"{row.entity_id}|{row.entity_type}|mentions={row.mention_count}"
-                for row in rows
+            return _safe_tool_output(
+                "\n".join(
+                    f"{row.entity_id}|{row.entity_type}|mentions={row.mention_count}"
+                    for row in rows
+                )
             )
 
     @tool
@@ -716,7 +726,7 @@ def build_langchain_tools(conn: Any):
                         if entity
                         else f"entity={resource_id}\n"
                     )
-                    return (
+                    return _safe_tool_output(
                         "Indexed evidence (preferred):\n"
                         + header
                         + format_evidence_mentions(mentions)
@@ -733,7 +743,7 @@ def build_langchain_tools(conn: Any):
                 limit=capped,
             )
             prefix = ("\n".join(f"({n})" for n in notes) + "\n") if notes else ""
-            return prefix + format_node_log_rows(rows)
+            return _safe_tool_output(prefix + format_node_log_rows(rows))
 
     @tool
     def search_sos_commands(
@@ -808,7 +818,7 @@ def build_langchain_tools(conn: Any):
                     0, f"resolved hostname {hostname!r} → {', '.join(hostnames)}"
                 )
             note = ("\n".join(f"({n})" for n in notes) + "\n") if notes else ""
-            return note + format_command_rows(rows)
+            return _safe_tool_output(note + format_command_rows(rows))
 
     @tool
     def get_related_entities(
@@ -836,7 +846,7 @@ def build_langchain_tools(conn: Any):
                 relation_types=types,
                 limit=max(1, min(int(limit), 50)),
             )
-            return format_relationships(rows)
+            return _safe_tool_output(format_relationships(rows))
 
     @tool
     def get_operation_path(
@@ -865,7 +875,7 @@ def build_langchain_tools(conn: Any):
                 target_type=target_type.strip(),
                 max_hops=max(1, min(int(max_hops), 6)),
             )
-            return format_operation_path(path, start_entity_id=start)
+            return _safe_tool_output(format_operation_path(path, start_entity_id=start))
 
     return [
         get_host_reboot_timeline,

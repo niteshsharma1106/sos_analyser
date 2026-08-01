@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .context_pack import truncate_text
+from .privacy import redact_sensitive_text
 
 LOGGER_NAME = "osp_sos"
 DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -91,7 +92,7 @@ class AgentRunTrace:
         self.add(
             "tool_end",
             f"Tool {name} returned",
-            details={"output_preview": truncate_text(output, 240)},
+            details={"output_preview": truncate_text(redact_sensitive_text(output), 240)},
         )
 
     def llm_start(self, stage: str, **details: Any) -> None:
@@ -165,7 +166,7 @@ def _safe_details(details: dict[str, Any]) -> dict[str, Any]:
         if value is None:
             continue
         if isinstance(value, str):
-            cleaned[key] = truncate_text(value, 400)
+            cleaned[key] = truncate_text(redact_sensitive_text(value), 400)
         elif isinstance(value, (int, float, bool)):
             cleaned[key] = value
         else:
@@ -253,7 +254,7 @@ def configure_logging(
         logger.setLevel(resolved_level)
         return logger
 
-    logger.handlers.clear()
+    close_logging(logger)
     logger.setLevel(resolved_level)
     logger.propagate = False
 
@@ -275,6 +276,17 @@ def configure_logging(
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     return logger
+
+
+def close_logging(logger: logging.Logger | None = None) -> None:
+    """Flush, detach, and close package handlers (important on Windows)."""
+    target = logger or logging.getLogger(LOGGER_NAME)
+    for handler in target.handlers[:]:
+        target.removeHandler(handler)
+        try:
+            handler.flush()
+        finally:
+            handler.close()
 
 
 def get_logger(name: str | None = None) -> logging.Logger:
