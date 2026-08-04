@@ -1,0 +1,51 @@
+---
+# Standalone Ansible play to harden OpenSSH crypto policy.
+# Replaces TripleO Heat template NodeExtraConfigPost usage:
+#   OS::TripleO::NodeExtraConfigPost → enable-crypto-policy.yaml
+#
+# Usage:
+#   ansible-playbook -i inventory ansible/enable-crypto-policy.yml
+
+- name: Enable crypto policy (disable SHA-1 and 64-bit MACs for OpenSSH)
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Ensure Include directive exists in sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^Include\s+/etc/ssh/sshd_config\.d/\*\.conf$'
+        line: 'Include /etc/ssh/sshd_config.d/*.conf'
+        insertbefore: BOF
+        state: present
+      notify: Validate and Restart sshd
+
+    - name: Deploy custom SSH crypto policy module
+      ansible.builtin.copy:
+        dest: /etc/crypto-policies/policies/modules/NO-SHA1-SSH.pmod
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Custom policy module to disable SHA-1 and 64-bit MACs for OpenSSH
+          mac@SSH = -HMAC-SHA1 -UMAC-64
+      notify:
+        - Apply crypto policy
+        - Validate and Restart sshd
+
+  handlers:
+    - name: Apply crypto policy
+      ansible.builtin.command:
+        cmd: update-crypto-policies --set DEFAULT:NO-SHA1-SSH
+
+    - name: Validate sshd configuration
+      ansible.builtin.command:
+        cmd: sshd -t
+      listen: Validate and Restart sshd
+
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+      listen: Validate and Restart sshd

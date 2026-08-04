@@ -1,0 +1,10 @@
+# Example inventory — replace hosts with your RHOSP/TripleO nodes.
+# ansible-playbook -i inventory ansible/enable-crypto-policy.yml
+
+[all]
+# controller-0 ansible_host=192.0.2.10
+# compute-0    ansible_host=192.0.2.20
+
+[all:vars]
+ansible_user=heat-admin
+ansible_become=true
