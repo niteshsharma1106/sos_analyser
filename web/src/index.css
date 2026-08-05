@@ -1,0 +1,62 @@
+:root {
+  --osp-ink: #101820;
+  --osp-ink-soft: #243040;
+  --osp-muted: #667788;
+  --osp-accent: #1f6f8b;
+  --osp-accent-deep: #155a72;
+  --osp-accent-wash: rgba(31, 111, 139, 0.12);
+  --osp-accent-line: rgba(31, 111, 139, 0.28);
+  --osp-user-bg: #e7f2f7;
+  --osp-surface: #ffffff;
+  --osp-line: rgba(16, 24, 32, 0.1);
+  --osp-shadow: 0 10px 28px rgba(16, 32, 48, 0.07);
+  --osp-radius: 0.85rem;
+  --osp-col: min(1120px, calc(100vw - 2rem));
+  --osp-font: "Outfit", sans-serif;
+  --osp-display: "Bricolage Grotesque", sans-serif;
+  --osp-mono: "IBM Plex Mono", monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--osp-font);
+  color: var(--osp-ink);
+  background-color: #edf1f4;
+  background-image:
+    radial-gradient(ellipse 90% 55% at 8% -8%, rgba(31, 111, 139, 0.18), transparent 58%),
+    radial-gradient(ellipse 70% 45% at 96% 4%, rgba(23, 50, 74, 0.1), transparent 52%),
+    linear-gradient(165deg, #f5f7f9 0%, #e8eef2 48%, #e3e9ee 100%);
+  overflow: hidden;
+}
+
+button,
+textarea,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+@media (max-width: 720px) {
+  :root {
+    --osp-col: calc(100vw - 1.2rem);
+  }
+
+  body {
+    overflow: auto;
+  }
+}

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from .llm_client import MissingLLMConfiguration
 
@@ -34,9 +35,41 @@ class LLMSettings:
     api_key_env: str
 
 
+def configure_tls_trust() -> None:
+    """
+    Make outbound HTTPS trust the corporate/OS certificate store.
+
+    Prefer an explicit PEM via ``OSP_SOS_CA_BUNDLE``. Otherwise inject the OS
+    trust store (Windows enterprise roots) so TLS inspection CAs work without
+    disabling verification.
+    """
+    ca_bundle = os.getenv("OSP_SOS_CA_BUNDLE", "").strip()
+    if ca_bundle:
+        bundle_path = Path(ca_bundle).expanduser()
+        if not bundle_path.is_file():
+            raise MissingLLMConfiguration(
+                f"OSP_SOS_CA_BUNDLE does not point to a readable PEM file: {bundle_path}"
+            )
+        path = str(bundle_path)
+        os.environ["SSL_CERT_FILE"] = path
+        os.environ["REQUESTS_CA_BUNDLE"] = path
+        return
+
+    use_system = os.getenv("OSP_SOS_USE_SYSTEM_CERTS", "1").strip().lower()
+    if use_system in {"0", "false", "no", "off"}:
+        return
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except Exception:  # noqa: BLE001 - TLS helper must never block startup
+        pass
+
+
 def load_app_env(*, override: bool = False) -> None:
     """Load `.env` into os.environ unless OSP_SOS_SKIP_DOTENV=1."""
     if os.getenv("OSP_SOS_SKIP_DOTENV") == "1":
+        configure_tls_trust()
         return
     from dotenv import load_dotenv
 
@@ -45,6 +78,7 @@ def load_app_env(*, override: bool = False) -> None:
     grok = os.getenv("GROK_API_KEY")
     if grok and not os.getenv("GROQ_API_KEY"):
         os.environ["GROQ_API_KEY"] = grok
+    configure_tls_trust()
 
 
 def normalize_provider(model_provider: str) -> str:

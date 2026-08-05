@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 
-from osp_sos_analyser.env_config import get_llm_settings
+from osp_sos_analyser.env_config import get_llm_settings, load_app_env
 from osp_sos_analyser.llm_client import MissingLLMConfiguration
 
 
@@ -19,6 +21,8 @@ class EnvConfigTests(unittest.TestCase):
                 "OSP_SOS_MODEL",
                 "OSP_SOS_MODEL_PROVIDER",
                 "OSP_SOS_SKIP_DOTENV",
+                "OSP_SOS_CA_BUNDLE",
+                "SSL_CERT_FILE",
             )
         }
         os.environ["OSP_SOS_SKIP_DOTENV"] = "1"
@@ -75,6 +79,16 @@ class EnvConfigTests(unittest.TestCase):
         os.environ["GOOGLE_API_KEY"] = "test-key"
         settings = get_llm_settings()
         self.assertEqual(settings.provider, "google_genai")
+
+    def test_ca_bundle_sets_python_tls_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = Path(tmpdir) / "company-ca.pem"
+            bundle.write_text("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n")
+            os.environ["OSP_SOS_CA_BUNDLE"] = str(bundle)
+            os.environ.pop("OSP_SOS_SKIP_DOTENV", None)
+            load_app_env()
+            self.assertEqual(os.environ["SSL_CERT_FILE"], str(bundle))
+            self.assertEqual(os.environ["REQUESTS_CA_BUNDLE"], str(bundle))
 
 
 if __name__ == "__main__":

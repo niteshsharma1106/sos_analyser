@@ -55,6 +55,18 @@ To run the Phase 2 detective workflow after ingestion:
 python main.py analyze "VMs on compute-03 suddenly lost network connectivity at 14:00" --db-path sos_analysis.duckdb
 ```
 
+You can also call the investigator directly from Python:
+
+```python
+from osp_sos_analyser import investigate_with_langgraph, render_investigation_result
+
+result = investigate_with_langgraph(
+    db_path="sos_analysis.duckdb",
+    prompt="VMs on compute-03 suddenly lost network connectivity at 14:00",
+)
+print(render_investigation_result(result))
+```
+
 Phase 2 uses a LangChain tool-calling agent by default. Create a local `.env` file first.
 Model, provider, and API key are read **only** from `.env` (no hardcoded defaults in code).
 
@@ -140,10 +152,7 @@ In the chat UI, keep **Show agent observability** enabled to append the node/too
 
 ## Chat UI (ask / answer)
 
-
-
-
-After ingestion, launch an interactive chat UI instead of the CLI:
+After ingestion, launch the React chat UI:
 
 ```bash
 uv run python main.py chat --db-path sos_analysis.duckdb
@@ -151,7 +160,16 @@ uv run python main.py chat --db-path sos_analysis.duckdb
 uv run osp-sos-chat --db-path sos_analysis.duckdb
 ```
 
-Open the printed local URL (default `http://127.0.0.1:7860`). Use **Offline mode** in Investigation settings for deterministic answers without an LLM.
+Open the printed local URL (default `http://127.0.0.1:7860`). Use **Offline mode** in Settings for deterministic answers without an LLM.
+
+To rebuild the frontend after editing `web/`:
+
+```bash
+cd web
+npm install
+npm run build
+```
+
 
 ## Implemented capabilities
 
@@ -164,7 +182,7 @@ Open the printed local URL (default `http://127.0.0.1:7860`). Use **Offline mode
 - Skips already-ingested archives through the ingested_reports registry table
 - Builds an evidence index and VM/port/chassis/host relationship graph
 - Provides deterministic offline investigation and an LLM-backed LangGraph RCA workflow
-- Includes a local Gradio chat interface and automated test coverage
+- Includes a local React chat interface (FastAPI) and automated test coverage
 
 ## Investigation workflow
 

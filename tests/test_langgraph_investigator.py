@@ -57,9 +57,19 @@ class LangGraphInvestigatorModuleTests(unittest.TestCase):
                 "final_rca": "Likely kernel panic",
             }
         )
-        self.assertIn("Root Cause Analysis", text)
         self.assertIn("Likely kernel panic", text)
-        self.assertIn("cluster_id=abc", text)
+        self.assertNotIn("cluster_id=abc", text)
+
+    def test_normal_chat_render_hides_internal_agent_material(self) -> None:
+        text = render_investigation_result(
+            {
+                "prefetch_digest": "controller warning noise",
+                "findings": {"investigator_raw": "internal scratchpad"},
+                "final_rca": "The requested VM list is instance-a.",
+            },
+            include_observability=False,
+        )
+        self.assertEqual(text, "The requested VM list is instance-a.")
 
     def test_init_llm_requires_api_key(self) -> None:
         previous = {
@@ -320,3 +330,14 @@ class GroqToolCallRecoveryTests(unittest.TestCase):
         self.assertEqual(out, "ok:comp008")
         missing = invoke_tool_by_name([_Tool()], "nope", {})
         self.assertIn("Unknown tool", missing)
+
+    def test_package_root_exports_dynamic_investigation(self) -> None:
+        from osp_sos_analyser import (
+            investigate_prompt_with_langchain,
+            investigate_with_langgraph,
+            render_investigation_result,
+        )
+
+        self.assertTrue(callable(investigate_prompt_with_langchain))
+        self.assertTrue(callable(investigate_with_langgraph))
+        self.assertTrue(callable(render_investigation_result))

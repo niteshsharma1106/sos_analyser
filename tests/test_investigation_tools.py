@@ -13,11 +13,67 @@ from osp_sos_analyser.investigation_tools import (
     build_langchain_tools,
     format_host_reboot_timeline,
     format_manifest,
+    parse_journalctl_list_boots,
     prefetch_investigation_digest,
 )
 
 
 class InvestigationToolsTests(unittest.TestCase):
+    def test_agent_can_create_a_temporary_read_only_analysis(self) -> None:
+        from osp_sos_analyser.db import ensure_schema
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.duckdb"
+            host = "n1-wrkld1-b1-b12-comp008"
+            with duckdb.connect(str(db_path)) as conn:
+                ensure_schema(conn)
+                conn.execute(
+                    """
+                    INSERT INTO cluster_nodes (
+                        cluster_id, hostname, node_role, rhosp_version, services,
+                        archive_name, archive_id
+                    ) VALUES ('cluster-1', ?, 'compute', '17.x', 'nova', 'sos', 'report-1')
+                    """,
+                    [host],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO entity_relationships (
+                        src_entity_id, src_entity_type, relation_type,
+                        dst_entity_id, dst_entity_type, evidence_count, confidence
+                    ) VALUES
+                        ('instance-a', 'instance', 'instance_host', ?, 'host', 1, 0.9),
+                        ('instance-b', 'instance', 'instance_host', ?, 'host', 1, 0.9)
+                    """,
+                    [host, host],
+                )
+                tools = {tool.name: tool for tool in build_langchain_tools(conn)}
+                result = tools["create_and_run_analysis"].invoke(
+                    {
+                        "name": "count_instances_on_compute",
+                        "purpose": "Count instances observed on the selected compute host.",
+                        "sql": (
+                            "SELECT count(DISTINCT src_entity_id) AS observed_instance_count "
+                            "FROM entity_relationships "
+                            "WHERE relation_type = 'instance_host' "
+                            "AND lower(dst_entity_id) = lower('comp008')"
+                        ),
+                    }
+                )
+                self.assertIn("Temporary analysis created", result)
+                self.assertIn("resolved hostname 'comp008'", result)
+                self.assertIn("observed_instance_count", result)
+                self.assertIn("2", result)
+
+                blocked = tools["create_and_run_analysis"].invoke(
+                    {
+                        "name": "unsafe",
+                        "purpose": "must not run writes",
+                        "sql": "DELETE FROM entity_relationships",
+                    }
+                )
+                self.assertIn("Only a single SELECT", blocked)
+
     def test_tools_prefer_evidence_index(self) -> None:
         port_id = "55ab45cf-6925-4811-a008-6fe60d491c5b"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -309,3 +365,68 @@ class InvestigationToolsTests(unittest.TestCase):
                 )
                 self.assertIn("expanded to reboot command set", cmds_fallback)
                 self.assertIn("dmesg", cmds_fallback.lower())
+
+    def test_parse_journalctl_list_boots(self) -> None:
+        blob = (
+            "IDX BOOT ID                          FIRST ENTRY                 LAST ENTRY\n"
+            " -1 09b773b6a3794ce485c95e0ba34695ba Sun 2026-07-26 23:50:13 IST "
+            "Mon 2026-07-27 02:34:06 IST\n"
+            "  0 11e3514c3a2e49148084a1e471fcded6 Mon 2026-07-27 02:38:27 IST "
+            "Mon 2026-07-27 09:51:02 IST\n"
+        )
+        boots = parse_journalctl_list_boots(blob)
+        self.assertEqual(len(boots), 2)
+        self.assertEqual(boots[0]["index"], -1)
+        self.assertEqual(boots[1]["index"], 0)
+        self.assertEqual(boots[1]["boot_id"], "11e3514c3a2e49148084a1e471fcded6")
+        self.assertIn("2026-07-27 02:38:27", boots[1]["first_entry"])
+
+    def test_reboot_timeline_discovers_list_boots_from_os_logs(self) -> None:
+        from osp_sos_analyser.db import ensure_schema
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "boots.duckdb"
+            host = "n1-wrkld1-b1-b12-comp008"
+            list_boots = (
+                "IDX BOOT ID                          FIRST ENTRY                 LAST ENTRY\n"
+                " -1 09b773b6a3794ce485c95e0ba34695ba Sun 2026-07-26 23:50:13 IST "
+                "Mon 2026-07-27 02:34:06 IST\n"
+                "  0 11e3514c3a2e49148084a1e471fcded6 Mon 2026-07-27 02:38:27 IST "
+                "Mon 2026-07-27 09:51:02 IST\n"
+            )
+            with duckdb.connect(str(db_path)) as conn:
+                ensure_schema(conn)
+                conn.execute(
+                    """
+                    INSERT INTO cluster_nodes (
+                        cluster_id, hostname, node_role, rhosp_version, services,
+                        archive_name, archive_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ["abc", host, "compute", "17.x", "nova", "sos.tar.xz", "id1"],
+                )
+                # Mimic real ingest: list-boots lands in os_logs with NULL timestamp.
+                conn.execute(
+                    """
+                    INSERT INTO os_logs (
+                        timestamp, level, service, message, source_file,
+                        report_name, hostname, node_role
+                    ) VALUES (
+                        NULL, 'UNKNOWN', 'system', ?,
+                        'sos_commands/systemd/journalctl_--list-boots',
+                        'sos', ?, 'compute'
+                    )
+                    """,
+                    [list_boots, host],
+                )
+
+                timeline = format_host_reboot_timeline(conn, "comp008")
+                self.assertIn("list-boots", timeline.lower())
+                self.assertIn("2026-07-27 02:38:27", timeline)
+                self.assertIn("11e3514c3a2e49148084a1e471fcded6", timeline)
+                self.assertIn("Last reboot / current boot start", timeline)
+                self.assertNotIn("ipmitool", timeline.lower())
+
+                tools = {tool.name: tool for tool in build_langchain_tools(conn)}
+                tool_out = tools["get_host_reboot_timeline"].invoke({"hostname": "comp008"})
+                self.assertIn("2026-07-27 02:38:27", tool_out)

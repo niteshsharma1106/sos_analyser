@@ -65,6 +65,14 @@ CRITICAL EXECUTION RULES:
 - Never write XML tags, <function=...>, or Python-style tool_name({...}) text.
 - Wait for each tool result before choosing the next tool.
 - Stay on the user question. Do not chase unrelated controller/OVN noise.
+- Before every tool call, check that its result directly reduces the uncertainty in
+  the user's exact question. Do not perform RCA, reboot, cluster-overview, or graph
+  exploration merely because those tools exist.
+- If none of the named tools can directly answer a read-only question, use
+  create_and_run_analysis to create a temporary SQL analysis for this request. Give
+  it a clear name and purpose, query only the supplied snapshot, and then use its
+  result. This is preferred over guessing or exploring unrelated evidence.
+- Stop immediately when the question has been answered. Do not gather extra evidence.
 
 Investigation order:
 A) Host reboot / crash / panic / power / auto-reboot questions (HIGHEST PRIORITY):
@@ -81,8 +89,13 @@ B) Other incidents:
    1) get_cluster_overview once if hostname/role is unclear.
    2) get_entity_evidence for UUID/req-id/hostname.
    3) compare_nodes only for multi-node noise questions.
-   4) get_related_entities / get_operation_path for UUID-centric network/VM paths.
+   4) get_related_entities / get_operation_path only for relationship/path questions.
    5) search_os_logs / list_indexed_entities as fallbacks.
+
+C) Inventory / count / list / summary questions:
+   1) Answer from the entity and relationship snapshot, not incident-RCA tools.
+   2) Use create_and_run_analysis when a count, grouping, or filter is needed.
+   3) State snapshot limitations clearly (observed/associated is not live state).
 
 Tool results are already digests. Do not paste them back in full.
 Stop once you can explain or rule out a root cause. End with a concise RCA.
@@ -707,6 +720,7 @@ def build_investigation_app(
         result: ExpandedQuery | None = None
         parse_error: str | None = None
         last_exc: Exception | None = None
+        salvage_completions: list[Any] = []
         for method in _structured_expand_methods(model_provider):
             try:
                 structured_llm = llm.with_structured_output(
@@ -724,6 +738,11 @@ def build_investigation_app(
                 break
             except Exception as exc:
                 last_exc = exc
+                completion = getattr(exc, "llm_output", None) or getattr(
+                    exc, "completion", None
+                ) or getattr(exc, "text", None)
+                if completion:
+                    salvage_completions.append(completion)
                 log.warning(
                     "Structured expand via %s failed (%s)",
                     method,
@@ -737,23 +756,23 @@ def build_investigation_app(
                 "Structured expand failed (%s); attempting salvage/fallback",
                 truncate_text(parse_error, 200),
             )
-            # Prefer salvaging model text from the exception when available.
-            completion = getattr(last_exc, "llm_output", None) or getattr(
-                last_exc, "completion", None
-            )
-            if isinstance(completion, dict):
-                completion = completion.get("text") or completion.get("content")
-            if not completion:
-                # LangChain OutputParserException often stores the raw text here.
-                completion = getattr(last_exc, "text", None) or str(last_exc)
-            # Strip the leading "Failed to parse ..." wrapper if present.
-            if isinstance(completion, str) and "from completion" in completion:
-                idx = completion.find("{")
-                if idx >= 0:
-                    completion = completion[idx:]
-            try:
-                result = _parse_partial_expanded_json(str(completion or ""), raw_query)
-            except Exception:
+            # The first JSON-mode call can contain a useful partial plan even if a
+            # later json_schema retry is rejected by the provider. Salvage in order.
+            for completion in [*salvage_completions, str(last_exc)]:
+                if isinstance(completion, dict):
+                    completion = completion.get("text") or completion.get("content")
+                if isinstance(completion, str) and "from completion" in completion:
+                    idx = completion.find("{")
+                    if idx >= 0:
+                        completion = completion[idx:]
+                try:
+                    candidate = _parse_partial_expanded_json(str(completion or ""), raw_query)
+                except Exception:
+                    continue
+                if candidate:
+                    result = candidate
+                    break
+            if result is None:
                 result = fallback_expanded_query(raw_query)
             run_trace.add(
                 "plan_fallback",
@@ -980,7 +999,8 @@ def build_investigation_app(
             else "No tool evidence was gathered."
         )
         rca_prompt = f"""
-    Incident: {plan.summary}
+    Original user question: {state.get('raw_query', plan.summary)}
+    Interpreted request: {plan.summary}
     Hypotheses considered: {plan.hypotheses}
     Prefetched cluster/evidence digest:
     {prefetch or 'None'}
@@ -988,7 +1008,10 @@ def build_investigation_app(
     Evidence gathered:
     {evidence_text}
 
-    Write a concise root cause analysis. Cite hostnames and entity IDs when possible.
+    Answer the user's actual request directly. Do not force an RCA format for an
+    inventory, count, list, relationship, or summary question: state the requested
+    result first and use the evidence only to qualify it. Cite hostnames and entity
+    IDs when possible.
     If this is a reboot/crash question: state the last boot/reboot time first (or say
     it could not be determined), then explain the likely cause around that window.
     Ignore unrelated controller/OVN warning noise unless it explains the reboot.
@@ -1049,8 +1072,8 @@ def investigate_with_langgraph(
     rebootish = is_rebootish_query(enriched)
     if include_graph and not rebootish:
         extras.append(
-            "Prefer relationship graph tools (get_related_entities, get_operation_path) "
-            "to map VM↔port↔chassis↔host."
+            "Relationship graph is available for questions that ask for relationships "
+            "or paths; use it only when it directly answers the question."
         )
     elif rebootish:
         extras.append(
@@ -1070,7 +1093,10 @@ def investigate_with_langgraph(
         )
     else:
         extras.append("Answer style: concise RCA.")
-    if extras:
+    # Presentation hints must not alter the text used for LLM planning.
+    # They remain UI metadata; mixing them into `enriched` made fallback plans
+    # investigate the graph/RCA hint rather than the user's question.
+    if False and extras:
         enriched = enriched + "\n\n" + "\n".join(extras)
 
     run_trace = trace or AgentRunTrace(prompt=enriched)
@@ -1122,35 +1148,12 @@ def render_investigation_result(
     *,
     include_observability: bool = True,
 ) -> str:
-    """Pretty-print a LangGraph investigation result as markdown-ish text."""
-    lines = ["# LangGraph Investigation Report", ""]
-    run_id = final_state.get("run_id")
-    if run_id:
-        lines.append(f"- run_id: `{run_id}`")
-    plan = final_state.get("expanded_plan")
-    if plan is not None:
-        intent = getattr(plan, "intent", None) or (plan.get("intent") if isinstance(plan, dict) else None)
-        window = getattr(plan, "time_window", None) or (
-            plan.get("time_window") if isinstance(plan, dict) else None
-        )
-        lines.append(f"- Intent: {intent}")
-        lines.append(f"- Time window: {window}")
-        lines.append("")
-    prefetch = final_state.get("prefetch_digest") or ""
-    if prefetch:
-        lines.extend(["## Prefetch digest", prefetch[:1500], ""])
-    findings = final_state.get("findings") or {}
-    if findings:
-        lines.append("## Findings")
-        for key, value in findings.items():
-            lines.append(f"### {key}")
-            lines.append(str(value))
-            lines.append("")
-    lines.append("## Root Cause Analysis")
-    lines.append(str(final_state.get("final_rca") or "No RCA generated."))
+    """Render the answer; observability never exposes internal prompt/evidence dumps."""
+    answer = str(final_state.get("final_rca") or "No answer generated.")
+    if not include_observability:
+        return answer
 
-    if include_observability:
-        restored = AgentRunTrace.from_dict(final_state.get("agent_trace"))
-        if restored and restored.events:
-            lines.extend(["", restored.render_markdown()])
-    return "\n".join(lines)
+    restored = AgentRunTrace.from_dict(final_state.get("agent_trace"))
+    if restored and restored.events:
+        return answer + "\n\n" + restored.render_markdown()
+    return answer

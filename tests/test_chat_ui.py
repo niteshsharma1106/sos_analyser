@@ -7,11 +7,26 @@ from unittest.mock import patch
 
 import duckdb
 
-from osp_sos_analyser.chat_ui import _answer_question, _normalize_chat_text, build_chat_app
+from osp_sos_analyser.chat_ui import (
+    _answer_question,
+    _exception_chain_text,
+    _normalize_chat_text,
+    build_chat_app,
+)
 from osp_sos_analyser.db import ensure_schema
 
 
 class ChatUiTests(unittest.TestCase):
+    def test_exception_chain_includes_nested_ssl_error(self) -> None:
+        root = OSError("CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate")
+        mid = ConnectionError("TLS handshake failed")
+        mid.__cause__ = root
+        outer = RuntimeError("Connection error.")
+        outer.__cause__ = mid
+        text = _exception_chain_text(outer)
+        self.assertIn("Connection error.", text)
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", text)
+
     def test_normalize_chat_text_multimodal_blocks(self) -> None:
         self.assertEqual(
             _normalize_chat_text(
@@ -102,7 +117,9 @@ class ChatUiTests(unittest.TestCase):
     def test_build_chat_app_constructs(self) -> None:
         app = build_chat_app(default_db_path="sos_analysis.duckdb", default_offline=True)
         self.assertIsNotNone(app)
-        self.assertTrue(hasattr(app, "launch"))
+        routes = {getattr(route, "path", None) for route in app.routes}
+        self.assertIn("/api/bootstrap", routes)
+        self.assertIn("/api/ask", routes)
 
 
 if __name__ == "__main__":

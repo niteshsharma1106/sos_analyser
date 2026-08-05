@@ -29,8 +29,8 @@ from .relationship_graph import (
 
 REBOOT_LOG_TERMS = (
     "reboot",
-    "shutdown",
-    "power off",
+    "System is rebooting",
+    "System is powering down",
     "kernel panic",
     "Oops:",
     "BUG:",
@@ -41,8 +41,9 @@ REBOOT_LOG_TERMS = (
     "oom-kill",
     "Resetting",
     "systemd-shutdown",
-    "Stopped target",
-    "Reached target Shutdown",
+    "Starting Reboot",
+    "Starting Halt",
+    "Linux version",
 )
 REBOOT_COMMAND_PATTERNS = (
     "dmesg",
@@ -50,16 +51,20 @@ REBOOT_COMMAND_PATTERNS = (
     "who_-b",
     "uptime",
     "journalctl",
+    "list-boots",
+    "hostnamectl",
     "ipmitool",
     "mcelog",
     "crash",
 )
 # Prefer these when establishing *when* a host last booted.
 BOOT_TIME_COMMAND_PATTERNS = (
+    "list-boots",
     "who_-b",
     "last",
     "uptime",
     "dmesg",
+    "hostnamectl",
     "journalctl",
 )
 _BOOT_HINT_RE = re.compile(
@@ -75,8 +80,11 @@ _BOOT_HINT_RE = re.compile(
     r"Kernel panic|"
     r"watchdog:|"
     r"systemd-shutdown|"
-    r"Stopped target|"
-    r"Starting Power-Off"
+    r"System is rebooting|"
+    r"System is powering down|"
+    r"Starting Power-Off|"
+    r"IDX BOOT ID|"
+    r"Boot ID:"
     r").*$"
 )
 _BOOT_DATETIME_RE = re.compile(
@@ -87,9 +95,18 @@ _BOOT_DATETIME_RE = re.compile(
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
     r"\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?\s+20\d{2}"
     r"|"
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+    r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\s+[A-Za-z_/]+)?"
+    r"|"
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
     r"\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s+20\d{2})?"
     r")"
+)
+# journalctl --list-boots rows (discovered from SOS, not hardcoded times).
+_LIST_BOOTS_LINE_RE = re.compile(
+    r"(?m)^\s*(-?\d+)\s+([0-9a-fA-F]{32})\s+"
+    r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\s+\S+)?)\s+"
+    r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\s+\S+)?)\s*$"
 )
 _REBOOTISH_QUERY_RE = re.compile(
     r"\b(reboot|rebooted|crash|panic|oom|shutdown|power[\s-]?off|watchdog|auto[\s-]?reboot)\b",
@@ -99,6 +116,66 @@ _REBOOTISH_QUERY_RE = re.compile(
 
 def is_rebootish_query(text: str) -> bool:
     return bool(_REBOOTISH_QUERY_RE.search(text or ""))
+
+
+_UNSAFE_ANALYSIS_SQL_RE = re.compile(
+    r"\b(?:alter|attach|call|copy|create|delete|detach|drop|export|import|insert|install|"
+    r"load|pragma|replace|set|update|vacuum)\b|--|/\*|;",
+    re.IGNORECASE,
+)
+
+
+def validate_analysis_sql(sql: str) -> str:
+    """Allow a temporary, read-only analytical query and reject control/write SQL."""
+    statement = (sql or "").strip()
+    if not statement:
+        raise ValueError("sql is required.")
+    if not re.match(r"^(?:select|with|explain)\b", statement, re.IGNORECASE):
+        raise ValueError("Only a single SELECT, WITH, or EXPLAIN query is allowed.")
+    if _UNSAFE_ANALYSIS_SQL_RE.search(statement):
+        raise ValueError("The analysis query contains a blocked SQL operation.")
+    return statement
+
+
+def format_analysis_rows(cursor: Any, *, limit: int = 100) -> str:
+    """Render a bounded, redacted result set for a dynamically-created analysis."""
+    columns = [str(item[0]) for item in (cursor.description or [])]
+    rows = cursor.fetchmany(max(1, min(int(limit), 100)))
+    if not columns:
+        return "Analysis completed but returned no tabular result."
+    lines = ["|".join(columns)]
+    for row in rows:
+        lines.append(
+            "|".join(
+                truncate_text(redact_sensitive_text(str(value or "")), 240).replace("\n", " ")
+                for value in row
+            )
+        )
+    return "\n".join(lines) if rows else "No rows returned."
+
+
+def canonicalize_analysis_hostnames(conn: Any, sql: str) -> tuple[str, list[str]]:
+    """Resolve short host aliases inside a temporary analysis SQL statement.
+
+    The agent sees the user's wording (for example ``comp008``), whereas the
+    relationship graph stores canonical hostnames.  This keeps dynamically-created
+    analyses portable without requiring a bespoke tool for every host query.
+    """
+    notes: list[str] = []
+
+    def replace_literal(match: re.Match[str]) -> str:
+        quote, value = match.group(1), match.group(2)
+        # SQL escaping produces doubled quotes; do not reinterpret such literals.
+        if "'" in value:
+            return match.group(0)
+        matches = resolve_hostnames(conn, value)
+        if len(matches) == 1 and matches[0].lower() != value.lower():
+            canonical = matches[0]
+            notes.append(f"resolved hostname {value!r} → {canonical!r}")
+            return f"{quote}{canonical}{quote}"
+        return match.group(0)
+
+    return re.sub(r"(['\"])([^'\"]+)\1", replace_literal, sql), notes
 
 
 def _extract_boot_hint_lines(output: str, *, limit: int = 8) -> list[str]:
@@ -115,6 +192,166 @@ def _extract_boot_hint_lines(output: str, *, limit: int = 8) -> list[str]:
     return lines
 
 
+def parse_journalctl_list_boots(text: str) -> list[dict[str, Any]]:
+    """Parse ``journalctl --list-boots`` tables discovered in SOS artifacts."""
+    boots: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for match in _LIST_BOOTS_LINE_RE.finditer(text or ""):
+        idx = int(match.group(1))
+        boot_id = match.group(2).lower()
+        key = (idx, boot_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        boots.append(
+            {
+                "index": idx,
+                "boot_id": boot_id,
+                "first_entry": match.group(3).strip(),
+                "last_entry": match.group(4).strip(),
+            }
+        )
+    boots.sort(key=lambda item: item["index"])
+    return boots
+
+
+def fetch_list_boots_artifacts(conn: Any, hostname: str, *, limit: int = 8) -> list[dict[str, str]]:
+    """
+    Locate ``journalctl --list-boots`` text for a host in either os_logs or os_commands.
+
+    SOS often stores this as a single log message with a NULL timestamp, so command-only
+    searches miss it.
+    """
+    host = (hostname or "").strip()
+    if not host:
+        return []
+    capped = max(1, min(int(limit), 20))
+    artifacts: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(source_kind: str, source_file: str, body: str) -> None:
+        text = (body or "").strip()
+        if not text or "IDX BOOT" not in text.upper():
+            return
+        key = f"{source_kind}|{source_file}|{text[:160]}"
+        if key in seen:
+            return
+        seen.add(key)
+        artifacts.append(
+            {
+                "source_kind": source_kind,
+                "source_file": source_file or "-",
+                "text": text,
+            }
+        )
+
+    log_rows = conn.execute(
+        """
+        SELECT COALESCE(source_file, ''), COALESCE(message, '')
+        FROM os_logs
+        WHERE lower(COALESCE(hostname, '')) = lower(?)
+          AND (
+            source_file ILIKE '%list-boots%'
+            OR message ILIKE '%IDX BOOT ID%'
+            OR message ILIKE '%IDX BOOT%'
+          )
+        LIMIT ?
+        """,
+        [host, capped],
+    ).fetchall()
+    for source_file, message in log_rows:
+        _add("os_logs", str(source_file or ""), str(message or ""))
+
+    cmd_rows = conn.execute(
+        """
+        SELECT COALESCE(source_file, ''), COALESCE(command, ''), COALESCE(output, '')
+        FROM os_commands
+        WHERE lower(COALESCE(hostname, '')) = lower(?)
+          AND (
+            source_file ILIKE '%list-boots%'
+            OR command ILIKE '%list-boots%'
+            OR output ILIKE '%IDX BOOT ID%'
+            OR output ILIKE '%IDX BOOT%'
+          )
+        LIMIT ?
+        """,
+        [host, capped],
+    ).fetchall()
+    for source_file, command, output in cmd_rows:
+        label = str(source_file or command or "")
+        _add("os_commands", label, str(output or ""))
+
+    return artifacts
+
+
+def discover_host_boots(conn: Any, hostname: str) -> dict[str, Any]:
+    """
+    Discover host boot records from SOS data (no hardcoded reboot times).
+
+    Prefer ``journalctl --list-boots``. Fall back to previous/current
+    ``journalctl --boot`` source-file time bounds when list-boots is absent.
+    """
+    artifacts = fetch_list_boots_artifacts(conn, hostname)
+    boots: list[dict[str, Any]] = []
+    sources: list[str] = []
+    for artifact in artifacts:
+        parsed = parse_journalctl_list_boots(artifact["text"])
+        if not parsed:
+            continue
+        sources.append(f"{artifact['source_kind']}:{artifact['source_file']}")
+        for boot in parsed:
+            if not any(
+                existing["index"] == boot["index"] and existing["boot_id"] == boot["boot_id"]
+                for existing in boots
+            ):
+                boots.append(boot)
+
+    boundary: dict[str, Any] = {}
+    try:
+        row = conn.execute(
+            """
+            SELECT
+              min(CASE
+                    WHEN source_file ILIKE '%journalctl%boot_-1%' THEN timestamp
+                  END),
+              max(CASE
+                    WHEN source_file ILIKE '%journalctl%boot_-1%' THEN timestamp
+                  END),
+              min(CASE
+                    WHEN source_file ILIKE '%journalctl%--boot%'
+                     AND source_file NOT ILIKE '%boot_-1%' THEN timestamp
+                  END),
+              max(CASE
+                    WHEN source_file ILIKE '%journalctl%--boot%'
+                     AND source_file NOT ILIKE '%boot_-1%' THEN timestamp
+                  END)
+            FROM os_logs
+            WHERE lower(COALESCE(hostname, '')) = lower(?)
+              AND timestamp IS NOT NULL
+            """,
+            [hostname],
+        ).fetchone()
+    except Exception:  # noqa: BLE001 - discovery must degrade gracefully
+        row = None
+    if row and any(row):
+        boundary = {
+            "previous_boot_first": row[0],
+            "previous_boot_last": row[1],
+            "current_boot_first_seen": row[2],
+            "current_boot_last_seen": row[3],
+        }
+
+    current = next((boot for boot in boots if boot["index"] == 0), None)
+    previous = next((boot for boot in boots if boot["index"] == -1), None)
+    return {
+        "boots": boots,
+        "sources": sources,
+        "current_boot": current,
+        "previous_boot": previous,
+        "boundary": boundary,
+    }
+
+
 def format_host_reboot_timeline(
     conn: Any,
     hostname: str,
@@ -122,8 +359,12 @@ def format_host_reboot_timeline(
     limit: int = 12,
 ) -> str:
     """
-    Deterministic first step for reboot RCA: establish when the host last booted
-    from sos_commands (who -b / last / uptime / dmesg / journalctl).
+    First-step reboot RCA helper: discover WHEN the host last booted from SOS data.
+
+    Discovery order (data-driven, not hardcoded times):
+    1. ``journalctl --list-boots`` in os_logs / os_commands
+    2. ``journalctl --boot`` / ``--boot -1`` time bounds
+    3. who -b / last / uptime / dmesg / hostnamectl excerpts
     """
     hint = (hostname or "").strip()
     if not hint:
@@ -136,6 +377,64 @@ def format_host_reboot_timeline(
     notes: list[str] = []
     if host.lower() != hint.lower():
         notes.append(f"resolved hostname {hint!r} → {host}")
+
+    discovery = discover_host_boots(conn, host)
+    boots = discovery["boots"]
+    current = discovery["current_boot"]
+    previous = discovery["previous_boot"]
+    boundary = discovery["boundary"]
+
+    boot_times: list[str] = []
+    evidence_blocks: list[str] = []
+
+    if boots:
+        notes.append("discovered boots via journalctl --list-boots")
+        for source in discovery["sources"][:3]:
+            notes.append(f"list-boots source: {source}")
+        table_lines = [
+            "idx|boot_id|first_entry|last_entry",
+        ]
+        for boot in boots:
+            table_lines.append(
+                f"{boot['index']}|{boot['boot_id']}|"
+                f"{boot['first_entry']}|{boot['last_entry']}"
+            )
+            for token in (boot["first_entry"], boot["last_entry"]):
+                if token and token not in boot_times:
+                    boot_times.append(token)
+        evidence_blocks.append(
+            f"{host}|journalctl --list-boots|discovered\n"
+            + "\n".join(f"  {line}" for line in table_lines)
+        )
+        if current:
+            evidence_blocks.append(
+                f"{host}|current boot (idx 0)\n"
+                f"  boot_id={current['boot_id']}\n"
+                f"  first_entry={current['first_entry']}\n"
+                f"  last_entry={current['last_entry']}"
+            )
+        if previous:
+            evidence_blocks.append(
+                f"{host}|previous boot (idx -1)\n"
+                f"  boot_id={previous['boot_id']}\n"
+                f"  first_entry={previous['first_entry']}\n"
+                f"  last_entry={previous['last_entry']}"
+            )
+
+    if boundary and (
+        boundary.get("previous_boot_last") or boundary.get("current_boot_first_seen")
+    ):
+        prev_last = boundary.get("previous_boot_last")
+        curr_first = boundary.get("current_boot_first_seen")
+        evidence_blocks.append(
+            f"{host}|journalctl --boot source bounds\n"
+            f"  previous(--boot -1) last={prev_last}\n"
+            f"  current(--boot) first_seen={curr_first}\n"
+            "  (first_seen may be later than true boot if large journals were tailed)"
+        )
+        if not boots and curr_first is not None:
+            boot_times.append(str(curr_first))
+            notes.append("list-boots missing; used journalctl --boot source bounds")
 
     rows = search_commands_by_node(
         conn,
@@ -155,18 +454,24 @@ def format_host_reboot_timeline(
         if rows:
             notes.append("boot-time patterns empty; used broader reboot command set")
 
-    boot_times: list[str] = []
-    evidence_blocks: list[str] = []
     for row in rows:
         command = str(row.get("command") or row.get("source_file") or "command")
+        source_file = str(row.get("source_file") or "")
         output = str(row.get("output") or "")
+        lower_cmd = f"{command} {source_file}".lower()
+        # Prefer boot-time artifacts; skip unrelated ipmitool noise when we already
+        # have list-boots / who -b style evidence.
+        if boots and "ipmitool" in lower_cmd and "list-boots" not in lower_cmd:
+            continue
+        if "list-boots" in lower_cmd and parse_journalctl_list_boots(output):
+            # Already rendered from discovery.
+            continue
         hints = _extract_boot_hint_lines(output, limit=6)
         if not hints and not any(
-            key in command.lower() or key in str(row.get("source_file") or "").lower()
-            for key in ("who_-b", "who -b", "last", "uptime")
+            key in lower_cmd
+            for key in ("who_-b", "who -b", "last", "uptime", "hostnamectl", "list-boots")
         ):
             continue
-        # For last/who -b/uptime, always show a short head even without regex hits.
         if not hints:
             head = truncate_text(output.strip() or "(empty output)", 400)
             hints = [line.strip() for line in head.splitlines() if line.strip()][:6]
@@ -176,14 +481,31 @@ def format_host_reboot_timeline(
                 if token and token not in boot_times:
                     boot_times.append(token)
         evidence_blocks.append(
-            f"{host}|{command}|{row.get('source_file') or '-'}\n"
+            f"{host}|{command}|{source_file or '-'}\n"
             + "\n".join(f"  {line}" for line in hints[:6])
         )
 
     lines = [f"## Last reboot / boot timeline for {host}"]
     if notes:
         lines.extend(f"({n})" for n in notes)
-    if boot_times:
+
+    if current:
+        lines.append(
+            f"Last reboot / current boot start (from list-boots idx 0): "
+            f"{current['first_entry']} (boot_id={current['boot_id']})"
+        )
+        if previous:
+            lines.append(
+                f"Previous boot ended: {previous['last_entry']} "
+                f"(boot_id={previous['boot_id']})"
+            )
+        lines.append(
+            "Next: investigate host logs/commands in the window between previous-boot "
+            "last_entry and current-boot first_entry "
+            "(panic/watchdog/OOM/MCE/Hardware Error). "
+            "Ignore user-session 'Reached target Shutdown' noise."
+        )
+    elif boot_times:
         lines.append(f"Likely boot/reboot timestamp candidates: {', '.join(boot_times[:5])}")
         lines.append(
             "Next: investigate logs/commands in a window around the newest candidate "
@@ -191,13 +513,14 @@ def format_host_reboot_timeline(
         )
     else:
         lines.append(
-            "No clear boot timestamp extracted yet. Inspect who -b / last / uptime / "
-            "dmesg / journalctl output below, then search logs around that time."
+            "No clear boot timestamp extracted yet. Inspect journalctl --list-boots / "
+            "who -b / last / uptime / dmesg output below, then search logs around that time."
         )
+
     if evidence_blocks:
         lines.append("")
-        lines.append("Boot-related sos_commands excerpts:")
-        lines.extend(evidence_blocks[:8])
+        lines.append("Boot-related evidence:")
+        lines.extend(evidence_blocks[:10])
     else:
         lines.append("")
         lines.append(format_command_rows(rows) if rows else "No sos_commands artifacts matched.")
@@ -426,7 +749,7 @@ def prefetch_investigation_digest(
 
     nodes = get_cluster_manifest(conn)
     # Skip noisy cross-node WARNING dumps for single-host reboot questions.
-    if len(nodes) > 1 and not rebootish:
+    if len(nodes) > 1 and not rebootish and not focus_hosts:
         comparison = compare_node_activity(conn, limit=40)
         sections.append("## Cross-node activity\n" + format_node_comparison(comparison))
 
@@ -460,7 +783,19 @@ def prefetch_investigation_digest(
                     levels=("CRITICAL", "ERROR", "WARNING"),
                     limit=limit_per_entity,
                 )
-                block = f"### Host {host}\n" + format_evidence_mentions(activity)
+                relationships = fetch_related_entities(
+                    conn,
+                    host,
+                    relation_types=("instance_host",),
+                    limit=100,
+                )
+                block = (
+                    f"### Host {host}\n"
+                    "Direct instance relationships (complete observed host inventory):\n"
+                    + format_relationships(relationships)
+                    + "\n\nHost activity:\n"
+                    + format_evidence_mentions(activity)
+                )
             host_blocks.append(block)
         sections.append("## Focused host evidence\n" + "\n\n".join(host_blocks))
 
@@ -530,14 +865,66 @@ def build_langchain_tools(conn: Any):
             return _safe_tool_output(format_manifest(conn))
 
     @tool
+    def create_and_run_analysis(
+        name: str,
+        purpose: str,
+        sql: str,
+    ) -> str:
+        """
+        Create and immediately run one temporary read-only analysis when the existing
+        investigation tools do not directly answer the user's question.
+
+        Use this for counts, lists, groupings, comparisons, and other questions that
+        need a new view of the ingested snapshot. `name` and `purpose` describe the
+        one-off tool you are creating; `sql` must be one SELECT/WITH query.
+
+        Available tables: cluster_nodes(cluster_id, hostname, node_role, rhosp_version,
+        services, archive_name, archive_id); entities(entity_id, entity_type,
+        mention_count, first_seen, last_seen); entity_mentions(entity_id, entity_type,
+        timestamp, hostname, service, level, source_file, report_name, message_excerpt);
+        entity_relationships(src_entity_id, src_entity_type, relation_type,
+        dst_entity_id, dst_entity_type, evidence_count, confidence, first_seen,
+        last_seen, hostnames, services, sample_excerpt, sample_hostname,
+        sample_service, sample_level); os_logs(..., hostname, node_role, service,
+        level, timestamp, message); os_commands(..., hostname, node_role, command,
+        output).
+
+        Example: to count instances observed on a host, count distinct src_entity_id
+        from entity_relationships where relation_type='instance_host' and
+        lower(dst_entity_id)=lower('<hostname>'). SOS reports are snapshots: describe
+        results as observed/associated, not live running state, unless live API data
+        is available.
+        """
+        label = (name or "temporary_analysis").strip()[:80]
+        objective = (purpose or "Answer the user's question").strip()[:240]
+        try:
+            statement = validate_analysis_sql(sql)
+        except ValueError as exc:
+            return f"Cannot create analysis {label!r}: {exc}"
+        with db_lock:
+            try:
+                statement, notes = canonicalize_analysis_hostnames(conn, statement)
+                result = conn.execute(statement)
+                rendered = format_analysis_rows(result)
+            except Exception as exc:  # noqa: BLE001 - give the agent a repairable query error
+                return f"Temporary analysis {label!r} failed: {type(exc).__name__}: {exc}"
+        note_text = ("\n".join(f"({note})" for note in notes) + "\n") if notes else ""
+        return _safe_tool_output(
+            f"Temporary analysis created: {label}\nPurpose: {objective}\n{note_text}{rendered}"
+        )
+
+    @tool
     def get_host_reboot_timeline(
         hostname: str,
         limit: int = 12,
     ) -> str:
         """
-        FIRST tool for reboot/crash questions. Establish when the host last booted
-        from who -b / last / uptime / dmesg / journalctl. Pass hostname (short or FQDN).
-        Do this before compare_nodes or generic log searches.
+        FIRST tool for reboot/crash questions. Discover WHEN the host last booted
+        from SOS data: journalctl --list-boots (preferred), then journalctl --boot
+        bounds, then who -b / last / uptime / dmesg / hostnamectl.
+        Pass hostname (short like comp008 or FQDN). Do this before compare_nodes
+        or generic log searches. Do not treat user-session 'Reached target Shutdown'
+        as a host reboot.
         """
         with db_lock:
             return _safe_tool_output(
@@ -878,6 +1265,7 @@ def build_langchain_tools(conn: Any):
             return _safe_tool_output(format_operation_path(path, start_entity_id=start))
 
     return [
+        create_and_run_analysis,
         get_host_reboot_timeline,
         get_cluster_overview,
         compare_nodes,
