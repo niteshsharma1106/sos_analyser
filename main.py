@@ -94,7 +94,7 @@ def build_analyze_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=None,
-        help="LangChain model for LLM-backed analysis. Defaults to OSP_SOS_MODEL.",
+        help="Optional model override. Default: OSP_SOS_MODEL from `.env`.",
     )
     parser.add_argument(
         "--offline",
@@ -129,7 +129,7 @@ def build_chat_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=None,
-        help="Optional model override (defaults to OSP_SOS_MODEL)",
+        help="Optional model override. Default: OSP_SOS_MODEL from `.env`.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="UI bind address")
     parser.add_argument("--port", type=int, default=7860, help="UI bind port")

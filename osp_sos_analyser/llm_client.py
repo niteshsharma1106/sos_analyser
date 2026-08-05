@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -23,16 +22,10 @@ class OpenAIResponsesClient:
         from .env_config import get_llm_settings
 
         settings = get_llm_settings(model=model, model_provider="openai")
-        api_key = os.getenv(settings.api_key_env)
-        if not api_key:
-            raise MissingLLMConfiguration(
-                f"LLM analysis requires {settings.api_key_env} in `.env`. "
-                "Set it, or run analyze with --offline."
-            )
 
         from openai import OpenAI
 
-        self._client = OpenAI(api_key=api_key)
+        self._client = OpenAI(api_key=settings.api_key)
         self._model = settings.model
 
     def structured(self, schema: type[T], system: str, user: str) -> T:

@@ -500,16 +500,16 @@ def format_host_reboot_timeline(
                 f"(boot_id={previous['boot_id']})"
             )
         lines.append(
-            "Next: investigate host logs/commands in the window between previous-boot "
-            "last_entry and current-boot first_entry "
-            "(panic/watchdog/OOM/MCE/Hardware Error). "
-            "Ignore user-session 'Reached target Shutdown' noise."
+            "Next (reasoning): (1) check this host for local crash signatures in the "
+            "previous→current boot gap; (2) if none, search OTHER cluster hosts in that "
+            "same window for this hostname and contemporaneous loss-of-contact / reboot / "
+            "evacuate reactions — do not invent BMC/manual reset without evidence."
         )
     elif boot_times:
         lines.append(f"Likely boot/reboot timestamp candidates: {', '.join(boot_times[:5])}")
         lines.append(
-            "Next: investigate logs/commands in a window around the newest candidate "
-            "(panic/watchdog/OOM/MCE/Hardware Error just before that time)."
+            "Next (reasoning): investigate this host around the newest candidate; if "
+            "local crash evidence is missing, widen to peer hosts in the same window."
         )
     else:
         lines.append(

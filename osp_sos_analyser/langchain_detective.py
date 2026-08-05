@@ -53,23 +53,17 @@ def investigate_prompt_with_langchain(
     model: str | None = None,
 ) -> InvestigationReport:
     from langchain.agents import create_agent
-    from langchain.chat_models import init_chat_model
 
-    from .env_config import get_llm_settings
+    from .env_config import get_llm_settings, init_chat_model_from_env
 
-    settings = get_llm_settings(model=model)
-
+    get_llm_settings(model=model)  # validate .env before building tools/agent
     store = AnalysisStore(db_path)
     evidence_cache: list[LogRecord | CommandRecord] = []
     agent_notes: list[AgentFinding] = []
 
     tools = _build_tools(store, evidence_cache, agent_notes)
 
-    llm = init_chat_model(
-        model=settings.model,
-        model_provider=settings.provider,
-    )
-    
+    llm = init_chat_model_from_env(model=model)    
     agent = create_agent(
         model=llm,
         tools=tools,

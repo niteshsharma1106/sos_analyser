@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from osp_sos_analyser.env_config import get_llm_settings, load_app_env
+from osp_sos_analyser.env_config import describe_llm_settings, get_llm_settings, load_app_env
 from osp_sos_analyser.llm_client import MissingLLMConfiguration
 
 
@@ -23,6 +23,9 @@ class EnvConfigTests(unittest.TestCase):
                 "OSP_SOS_SKIP_DOTENV",
                 "OSP_SOS_CA_BUNDLE",
                 "SSL_CERT_FILE",
+                "OSP_SOS_API_KEY",
+                "OSP_SOS_DOTENV",
+                "REQUESTS_CA_BUNDLE",
             )
         }
         os.environ["OSP_SOS_SKIP_DOTENV"] = "1"
@@ -64,6 +67,17 @@ class EnvConfigTests(unittest.TestCase):
         self.assertEqual(settings.model, "gemini-2.5-flash")
         self.assertEqual(settings.provider, "google_genai")
         self.assertEqual(settings.api_key_env, "GOOGLE_API_KEY")
+        self.assertEqual(settings.api_key, "test-key")
+
+    def test_unified_api_key_alias(self) -> None:
+        os.environ["OSP_SOS_MODEL"] = "llama-3.3-70b-versatile"
+        os.environ["OSP_SOS_MODEL_PROVIDER"] = "groq"
+        os.environ["OSP_SOS_API_KEY"] = "unified-secret"
+        settings = get_llm_settings()
+        self.assertEqual(settings.provider, "groq")
+        self.assertEqual(settings.api_key_env, "GROQ_API_KEY")
+        self.assertEqual(settings.api_key, "unified-secret")
+        self.assertEqual(os.environ.get("GROQ_API_KEY"), "unified-secret")
 
     def test_empty_override_keeps_env_values(self) -> None:
         os.environ["OSP_SOS_MODEL"] = "openai/gpt-oss-120b"
@@ -80,7 +94,35 @@ class EnvConfigTests(unittest.TestCase):
         settings = get_llm_settings()
         self.assertEqual(settings.provider, "google_genai")
 
-    def test_ca_bundle_sets_python_tls_bundle(self) -> None:
+    def test_groq_compound_mini_alias(self) -> None:
+        os.environ["OSP_SOS_MODEL"] = "compound-mini"
+        os.environ["OSP_SOS_MODEL_PROVIDER"] = "groq"
+        os.environ["GROQ_API_KEY"] = "test-key"
+        settings = get_llm_settings()
+        self.assertEqual(settings.model, "groq/compound-mini")
+
+    def test_dotenv_llm_keys_override_stale_process_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dotenv = Path(tmpdir) / ".env"
+            dotenv.write_text(
+                "OSP_SOS_MODEL_PROVIDER=groq\n"
+                'OSP_SOS_MODEL="compound-mini"\n'
+                "GROQ_API_KEY=from-file\n",
+                encoding="utf-8",
+            )
+            os.environ.pop("OSP_SOS_SKIP_DOTENV", None)
+            os.environ["OSP_SOS_DOTENV"] = str(dotenv)
+            # Stale shell values that used to win under load_dotenv(override=False).
+            os.environ["OSP_SOS_MODEL"] = "openai/gpt-oss-120b"
+            os.environ["OSP_SOS_MODEL_PROVIDER"] = "groq"
+            os.environ["GROQ_API_KEY"] = "stale-shell-key"
+
+            load_app_env()
+            settings = get_llm_settings()
+            self.assertEqual(settings.model, "compound-mini")
+            self.assertEqual(settings.api_key, "from-file")
+            self.assertIn("compound-mini", describe_llm_settings())
+
         with tempfile.TemporaryDirectory() as tmpdir:
             bundle = Path(tmpdir) / "company-ca.pem"
             bundle.write_text("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n")

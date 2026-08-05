@@ -183,6 +183,7 @@ def _answer_question(
         result = investigate_with_langgraph(
             db_path=db,
             prompt=prompt,
+            # Model/provider/API key always come from `.env` (optional CLI --model only).
             model=(model or "").strip() or None,
             focus_entity=focus_entity.strip() or None,
             answer_style=answer_style,
@@ -223,6 +224,14 @@ def _answer_question(
                 "   `OSP_SOS_CA_BUNDLE=C:\\path\\to\\company-root-ca.pem`\n"
                 "3. Or enable **Offline mode** in Settings for DuckDB-only answers.\n\n"
                 "Certificate verification stays enabled."
+            )
+        if "model_not_found" in lower or "does not exist or you do not have access" in lower:
+            return (
+                "The configured LLM model was rejected by the provider (model_not_found).\n\n"
+                "Check `OSP_SOS_MODEL` in `.env`.\n"
+                "For Groq Compound Mini use: `OSP_SOS_MODEL=groq/compound-mini`\n"
+                "Other Groq examples: `llama-3.3-70b-versatile`, `openai/gpt-oss-120b`.\n\n"
+                f"Details: `{type(exc).__name__}: {exc}`"
             )
         return f"Investigation failed: `{type(exc).__name__}: {exc}`"
 
@@ -276,25 +285,34 @@ def build_chat_app(
         banner = ""
         if Path(default_db_path).exists():
             banner = _cluster_banner(default_db_path)
+        env_model = cli_model
+        try:
+            from .env_config import get_llm_settings
+
+            env_model = cli_model or get_llm_settings().model
+        except Exception:  # noqa: BLE001 - bootstrap must stay available offline
+            pass
         return BootstrapResponse(
             cluster_banner=banner,
             llm_status=describe_llm_settings(),
             defaults=ChatDefaults(
                 db_path=default_db_path,
                 offline=default_offline,
-                model=cli_model,
+                model=env_model,
             ),
             examples=DEFAULT_EXAMPLES,
         )
 
     @app.post("/api/ask", response_model=AskResponse)
     def ask(payload: AskRequest) -> AskResponse:
+        # Model/provider/API key always come from `.env`. Ignore any client-supplied
+        # model field; only an optional CLI --model override may be applied.
         answer = _answer_question(
             payload.message,
             [],
             payload.db_path,
             payload.offline,
-            payload.model or cli_model,
+            cli_model,
             payload.focus_entity,
             payload.include_graph,
             payload.answer_style,

@@ -64,33 +64,48 @@ CRITICAL EXECUTION RULES:
 - Call tools ONE AT A TIME via the native tool-calling API only.
 - Never write XML tags, <function=...>, or Python-style tool_name({...}) text.
 - Wait for each tool result before choosing the next tool.
-- Stay on the user question. Do not chase unrelated controller/OVN noise.
-- Before every tool call, check that its result directly reduces the uncertainty in
-  the user's exact question. Do not perform RCA, reboot, cluster-overview, or graph
-  exploration merely because those tools exist.
+- Stay on the user question. Do not chase unrelated noise.
+- Before every tool call, check that its result reduces uncertainty in the user's
+  exact question. Prefer the next most informative check over broad dumps.
 - If none of the named tools can directly answer a read-only question, use
   create_and_run_analysis to create a temporary SQL analysis for this request. Give
   it a clear name and purpose, query only the supplied snapshot, and then use its
   result. This is preferred over guessing or exploring unrelated evidence.
-- Stop immediately when the question has been answered. Do not gather extra evidence.
+- Stop when the question is answered with evidence. Do not invent causes.
+
+Reasoning style (apply to every investigation):
+- Separate facts (timestamps, tool quotes) from hypotheses.
+- After each tool result, ask: what is still unexplained? Choose the next tool
+  that would falsify or confirm the leading uncertainty.
+- Absence of one class of evidence is not proof of a specific alternative cause.
+  Say "not found in available SOS" when that is all you know.
+- When the affected host's own logs are silent or inconclusive around an event,
+  widen the search to other ingested cluster nodes for the same time window and
+  for mentions of that hostname (short or FQDN). Management-plane or peer logs
+  often explain what the host itself never wrote.
+- Prefer positive evidence that names the host and action over generic guesses
+  (do not default to BMC / manual power-cycle / "external reset" without quotes).
 
 Investigation order:
 A) Host reboot / crash / panic / power / auto-reboot questions (HIGHEST PRIORITY):
-   1. Call get_host_reboot_timeline with the hostname first. Goal: establish WHEN
-      the compute last booted (who -b / last / uptime / dmesg / journalctl).
-   2. Only after a boot/reboot time candidate exists, call search_sos_commands and/or
-      search_os_logs on that hostname for panic/watchdog/oom-kill/Hardware Error/MCE
-      around that time. Leave service empty for these searches.
-   3. Do NOT call compare_nodes, get_related_entities, or get_operation_path for a
-      single-host reboot question unless the timeline proves a multi-node event.
-   4. Answer with: last boot time (if known) → likely cause → supporting evidence.
+   1. Call get_host_reboot_timeline with the hostname first → establish WHEN.
+   2. On that host, search around the boot window for local OS crash evidence
+      (panic/watchdog/oom/MCE/Hardware Error, abrupt halt). Leave service empty.
+   3. If local cause is missing or logs stop abruptly before boot:
+      - search OTHER cluster hosts (or leave hostname empty / use controller peers)
+        for the same window AND for the compute hostname / short name;
+      - look for contemporaneous loss-of-contact, reboot/termination/evacuate, or
+        peer reactions that reference this host;
+      - use create_and_run_analysis if you need a time-bounded cross-host query.
+   4. Answer: last boot time → evidenced cause (or unknown) → what remains open.
+      Cite hostnames and times. Do not fill gaps with unverified external-reset stories.
 
 B) Other incidents:
    1) get_cluster_overview once if hostname/role is unclear.
    2) get_entity_evidence for UUID/req-id/hostname.
-   3) compare_nodes only for multi-node noise questions.
-   4) get_related_entities / get_operation_path only for relationship/path questions.
-   5) search_os_logs / list_indexed_entities as fallbacks.
+   3) compare_nodes when multi-node contrast helps.
+   4) get_related_entities / get_operation_path for relationship/path questions.
+   5) search_os_logs / list_indexed_entities / create_and_run_analysis as needed.
 
 C) Inventory / count / list / summary questions:
    1) Answer from the entity and relationship snapshot, not incident-RCA tools.
@@ -98,7 +113,7 @@ C) Inventory / count / list / summary questions:
    3) State snapshot limitations clearly (observed/associated is not live state).
 
 Tool results are already digests. Do not paste them back in full.
-Stop once you can explain or rule out a root cause. End with a concise RCA.
+End with a concise, evidence-backed answer.
 """
 
 # Groq Llama / gpt-oss models sometimes emit tool calls as
@@ -514,12 +529,10 @@ def _required_api_key(model_provider: str) -> str | None:
 
 
 def _init_llm(model: str | None = None, model_provider: str | None = None):
-    from langchain.chat_models import init_chat_model
-
-    from .env_config import get_llm_settings
+    from .env_config import get_llm_settings, init_chat_model_from_env
 
     settings = get_llm_settings(model=model, model_provider=model_provider)
-    llm = init_chat_model(model=settings.model, model_provider=settings.provider)
+    llm = init_chat_model_from_env(model=model, model_provider=model_provider)
     # OpenAI-compatible APIs accept this; Google GenAI rejects it as an
     # unknown GenerateContentConfig field.
     if settings.provider in {"openai", "groq"}:
@@ -840,19 +853,23 @@ def build_investigation_app(
         if rebootish:
             host_hint = hostname or "the compute hostname from the question"
             mission = (
-                "REBOOT MISSION (follow exactly):\n"
-                f"1) Establish WHEN {host_hint} last rebooted/booted "
-                "(use get_host_reboot_timeline; who -b / last / uptime / dmesg).\n"
-                "2) Then investigate ONLY around that time for panic/watchdog/OOM/MCE/"
-                "Hardware Error on that host.\n"
-                "3) Ignore unrelated controller/OVN/nova WARNING noise unless it "
-                "clearly explains the reboot.\n"
-                "4) Final answer must state last boot time (or that it is unknown) "
-                "before the root-cause claim.\n"
+                "REBOOT MISSION (reason step-by-step; do not invent causes):\n"
+                f"1) Establish WHEN {host_hint} last booted "
+                "(get_host_reboot_timeline).\n"
+                "2) On that host, check the boot window for local OS crash evidence "
+                "(panic/watchdog/OOM/MCE/Hardware Error) or an abrupt log stop.\n"
+                "3) If local evidence does not explain the reboot: widen. Search other "
+                "ingested cluster hosts in the same window for mentions of this hostname "
+                "(short or FQDN) and for contemporaneous loss-of-contact / reboot / "
+                "evacuate / termination reactions. Use create_and_run_analysis if needed.\n"
+                "4) Final answer: boot time first, then only causes supported by quotes. "
+                "If still unknown, say what is missing — do not default to BMC/manual "
+                "external reset without positive evidence.\n"
             )
         else:
             mission = (
-                "Investigate this RHOSP incident using Cluster Manifest + Evidence Index tools.\n"
+                "Investigate this RHOSP incident. After each tool result, pick the next "
+                "check that most reduces uncertainty in the user question.\n"
             )
         base_user_message = (
             f"{mission}\n"
@@ -1013,9 +1030,11 @@ def build_investigation_app(
     result first and use the evidence only to qualify it. Cite hostnames and entity
     IDs when possible.
     If this is a reboot/crash question: state the last boot/reboot time first (or say
-    it could not be determined), then explain the likely cause around that window.
-    Ignore unrelated controller/OVN warning noise unless it explains the reboot.
-    If evidence is weak, say so and recommend next checks.
+    it could not be determined). Prefer causes supported by direct quotes from tools.
+    If the host's own logs lack a crash signature, weigh peer/controller evidence from
+    the same window that names this host. Do not invent BMC/manual/"external reset"
+    explanations without positive evidence — say unknown and what to check next.
+    Separate facts from hypotheses. If evidence is weak, say so.
     """
         synth_cb = AgentObservabilityCallback(run_trace, stage="synthesize")
         result = llm.invoke(
@@ -1077,8 +1096,9 @@ def investigate_with_langgraph(
         )
     elif rebootish:
         extras.append(
-            "Reboot question: first establish last boot time for the compute host, "
-            "then investigate cause around that timestamp. Do not use relationship-graph tools."
+            "Reboot question: establish last boot time, seek local cause, then if "
+            "unexplained widen to other cluster hosts in the same window for mentions "
+            "of this hostname. Do not invent external-reset causes without evidence."
         )
     style = (answer_style or "Concise RCA").strip()
     if style == "Evidence-heavy":

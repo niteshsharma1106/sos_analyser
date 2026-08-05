@@ -11,6 +11,7 @@ from osp_sos_analyser.db import ensure_schema
 from osp_sos_analyser.langgraph_investigator import (
     ExpandedQuery,
     InvestigationEntities,
+    INVESTIGATOR_SYSTEM_PROMPT,
     _init_llm,
     _normalize_node_role,
     _parse_partial_expanded_json,
@@ -26,6 +27,17 @@ from osp_sos_analyser.llm_client import MissingLLMConfiguration
 
 
 class LangGraphInvestigatorModuleTests(unittest.TestCase):
+    def test_investigator_prompt_prefers_reasoning_over_hardcoded_reboot_cause(self) -> None:
+        prompt = INVESTIGATOR_SYSTEM_PROMPT
+        self.assertIn("widen the search", prompt.lower())
+        self.assertIn("not found in available SOS", prompt)
+        self.assertIn("external reset", prompt.lower())
+        self.assertNotIn(
+            "Do NOT call compare_nodes, get_related_entities, or get_operation_path",
+            prompt,
+        )
+        self.assertNotIn("Ignore unrelated controller/OVN", prompt)
+
     def test_expanded_query_model_accepts_notebook_shape(self) -> None:
         plan = ExpandedQuery(
             summary="Port binding failed",
