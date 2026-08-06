@@ -387,6 +387,7 @@ class InvestigationToolsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "boots.duckdb"
             host = "n1-wrkld1-b1-b12-comp008"
+            ctrl = "n1-wrkld1-b1-b13-ctrl001"
             list_boots = (
                 "IDX BOOT ID                          FIRST ENTRY                 LAST ENTRY\n"
                 " -1 09b773b6a3794ce485c95e0ba34695ba Sun 2026-07-26 23:50:13 IST "
@@ -396,15 +397,16 @@ class InvestigationToolsTests(unittest.TestCase):
             )
             with duckdb.connect(str(db_path)) as conn:
                 ensure_schema(conn)
-                conn.execute(
-                    """
-                    INSERT INTO cluster_nodes (
-                        cluster_id, hostname, node_role, rhosp_version, services,
-                        archive_name, archive_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    ["abc", host, "compute", "17.x", "nova", "sos.tar.xz", "id1"],
-                )
+                for name, role in ((host, "compute"), (ctrl, "controller")):
+                    conn.execute(
+                        """
+                        INSERT INTO cluster_nodes (
+                            cluster_id, hostname, node_role, rhosp_version, services,
+                            archive_name, archive_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        ["abc", name, role, "17.x", "nova", "sos.tar.xz", f"id-{role}"],
+                    )
                 # Mimic real ingest: list-boots lands in os_logs with NULL timestamp.
                 conn.execute(
                     """
@@ -419,14 +421,44 @@ class InvestigationToolsTests(unittest.TestCase):
                     """,
                     [list_boots, host],
                 )
+                conn.execute(
+                    """
+                    INSERT INTO os_logs (
+                        timestamp, level, service, message, source_file,
+                        report_name, hostname, node_role
+                    ) VALUES
+                    (?, 'ERROR', 'system', ?, 'pacemaker.log', 'sos', ?, 'controller'),
+                    (?, 'NOTICE', 'system', ?, 'pacemaker.log', 'sos', ?, 'controller')
+                    """,
+                    [
+                        "2026-07-27 02:33:45",
+                        f"Remote connection to {host} unexpectedly dropped during monitor",
+                        ctrl,
+                        "2026-07-27 02:34:47",
+                        f"Peer {host} was terminated (reboot) by peer-ctrl: OK",
+                        ctrl,
+                    ],
+                )
 
                 timeline = format_host_reboot_timeline(conn, "comp008")
                 self.assertIn("list-boots", timeline.lower())
                 self.assertIn("2026-07-27 02:38:27", timeline)
                 self.assertIn("11e3514c3a2e49148084a1e471fcded6", timeline)
                 self.assertIn("Last reboot / current boot start", timeline)
+                self.assertIn("Peer/cluster mentions", timeline)
+                self.assertIn("terminated (reboot)", timeline)
+                self.assertIn(ctrl, timeline)
                 self.assertNotIn("ipmitool", timeline.lower())
 
                 tools = {tool.name: tool for tool in build_langchain_tools(conn)}
                 tool_out = tools["get_host_reboot_timeline"].invoke({"hostname": "comp008"})
                 self.assertIn("2026-07-27 02:38:27", tool_out)
+                self.assertIn("terminated (reboot)", tool_out)
+                peer_out = tools["search_peer_mentions"].invoke(
+                    {
+                        "hostname": "comp008",
+                        "start_time": "2026-07-27 02:30:00",
+                        "end_time": "2026-07-27 02:45:00",
+                    }
+                )
+                self.assertIn("terminated (reboot)", peer_out)

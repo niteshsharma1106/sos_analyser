@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from datetime import datetime, timedelta
 from typing import Any
 
 from .context_pack import truncate_text
@@ -112,10 +113,63 @@ _REBOOTISH_QUERY_RE = re.compile(
     r"\b(reboot|rebooted|crash|panic|oom|shutdown|power[\s-]?off|watchdog|auto[\s-]?reboot)\b",
     re.I,
 )
+_ISO_BOOT_TS_RE = re.compile(r"(20\d{2}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})")
+# Rank peer reactions that commonly explain a host reboot (generic, not product-specific).
+_PEER_REACTION_RANK_SQL = """
+CASE
+  WHEN lower(message) LIKE '%terminated%' THEN 0
+  WHEN lower(message) LIKE '%fence%' OR lower(message) LIKE '%stonith%' THEN 1
+  WHEN lower(message) LIKE '% was reboot%' OR lower(message) LIKE '%(reboot)%' THEN 2
+  WHEN lower(message) LIKE '%state is now lost%' OR lower(message) LIKE '% unexpectedly dropped%' THEN 3
+  WHEN lower(message) LIKE '%evacuate%' THEN 4
+  WHEN lower(message) LIKE '%monitor%' AND lower(message) LIKE '%error%' THEN 5
+  ELSE 6
+END
+"""
 
 
 def is_rebootish_query(text: str) -> bool:
     return bool(_REBOOTISH_QUERY_RE.search(text or ""))
+
+
+def parse_boot_entry_timestamp(text: str | None) -> datetime | None:
+    """Parse ``Mon 2026-07-27 02:34:06 IST`` / ISO fragments from list-boots rows."""
+    if not text:
+        return None
+    match = _ISO_BOOT_TS_RE.search(str(text))
+    if not match:
+        return None
+    try:
+        return datetime.fromisoformat(f"{match.group(1)} {match.group(2)}")
+    except ValueError:
+        return None
+
+
+def hostname_mention_tokens(hostname: str) -> list[str]:
+    """Tokens peers use when naming a host (FQDN, short name, trailing comp008/ctrl001)."""
+    host = (hostname or "").strip()
+    if not host:
+        return []
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str) -> None:
+        token = value.strip()
+        if not token:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        tokens.append(token)
+
+    _add(host)
+    short = host.split(".", 1)[0]
+    _add(short)
+    trailing = re.search(r"((?:comp|ctrl|ceph|compute|controller)\d+)$", short, re.I)
+    if trailing:
+        _add(trailing.group(1))
+    return tokens
 
 
 _UNSAFE_ANALYSIS_SQL_RE = re.compile(
@@ -500,16 +554,15 @@ def format_host_reboot_timeline(
                 f"(boot_id={previous['boot_id']})"
             )
         lines.append(
-            "Next (reasoning): (1) check this host for local crash signatures in the "
-            "previous→current boot gap; (2) if none, search OTHER cluster hosts in that "
-            "same window for this hostname and contemporaneous loss-of-contact / reboot / "
-            "evacuate reactions — do not invent BMC/manual reset without evidence."
+            "Next (reasoning): read Peer/cluster mentions below (already searched in the "
+            "boot gap on OTHER hosts). Use those quotes for the cause when local crash "
+            "signatures are missing — do not invent BMC/manual reset without evidence."
         )
     elif boot_times:
         lines.append(f"Likely boot/reboot timestamp candidates: {', '.join(boot_times[:5])}")
         lines.append(
             "Next (reasoning): investigate this host around the newest candidate; if "
-            "local crash evidence is missing, widen to peer hosts in the same window."
+            "local crash evidence is missing, use peer/cluster mentions in the same window."
         )
     else:
         lines.append(
@@ -524,6 +577,44 @@ def format_host_reboot_timeline(
     else:
         lines.append("")
         lines.append(format_command_rows(rows) if rows else "No sos_commands artifacts matched.")
+
+    # Auto-widen: peer hosts often explain what the rebooted host never logged.
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    if previous:
+        window_start = parse_boot_entry_timestamp(previous.get("last_entry"))
+    if current:
+        window_end = parse_boot_entry_timestamp(current.get("first_entry"))
+    if window_start is None and boundary.get("previous_boot_last") is not None:
+        try:
+            window_start = datetime.fromisoformat(str(boundary["previous_boot_last"]))
+        except ValueError:
+            window_start = None
+    if window_end is None and boundary.get("current_boot_first_seen") is not None:
+        try:
+            window_end = datetime.fromisoformat(str(boundary["current_boot_first_seen"]))
+        except ValueError:
+            window_end = None
+    if window_start is not None or window_end is not None:
+        peer_start = (window_start - timedelta(minutes=5)) if window_start else None
+        peer_end = (window_end + timedelta(minutes=15)) if window_end else None
+        peer_rows = search_peer_host_mentions(
+            conn,
+            host,
+            start_time=peer_start,
+            end_time=peer_end,
+            limit=25,
+        )
+        lines.append("")
+        lines.append(
+            format_peer_host_mentions(
+                peer_rows,
+                hostname=host,
+                start_time=peer_start,
+                end_time=peer_end,
+            )
+        )
+
     return "\n".join(lines)
 
 
@@ -691,6 +782,106 @@ def resolve_hostnames(conn: Any, hint: str) -> list[str]:
             contains.append(host)
     matches = boundary or contains
     return matches or [hint.strip()]
+
+
+def search_peer_host_mentions(
+    conn: Any,
+    hostname: str,
+    *,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    exclude_self: bool = True,
+    limit: int = 40,
+) -> list[dict[str, Any]]:
+    """
+    Search OTHER cluster hosts for log lines that mention ``hostname``.
+
+    Used for reboot RCA when the affected host's own logs stop before the reboot
+    and peers record loss-of-contact / reboot / fence reactions.
+    """
+    hosts = resolve_hostnames(conn, hostname)
+    if not hosts:
+        return []
+    target = hosts[0]
+    tokens = hostname_mention_tokens(target)
+    if not tokens:
+        return []
+
+    clauses: list[str] = []
+    params: list[object] = []
+    if exclude_self:
+        clauses.append("lower(COALESCE(hostname, '')) != lower(?)")
+        params.append(target)
+    if start_time is not None:
+        clauses.append("timestamp >= ?")
+        params.append(start_time)
+    if end_time is not None:
+        clauses.append("timestamp <= ?")
+        params.append(end_time)
+    mention_sql = " OR ".join("message ILIKE ?" for _ in tokens)
+    clauses.append(f"({mention_sql})")
+    params.extend(f"%{token}%" for token in tokens)
+    params.append(max(1, min(int(limit), 80)))
+
+    rows = conn.execute(
+        f"""
+        SELECT timestamp, COALESCE(hostname, ''), COALESCE(node_role, ''),
+               service, level, message, source_file, report_name
+        FROM os_logs
+        WHERE {' AND '.join(clauses)}
+        ORDER BY
+          {_PEER_REACTION_RANK_SQL},
+          timestamp NULLS LAST
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [
+        {
+            "timestamp": row[0],
+            "hostname": str(row[1] or ""),
+            "node_role": str(row[2] or ""),
+            "service": str(row[3] or ""),
+            "level": str(row[4] or ""),
+            "message": str(row[5] or ""),
+            "source_file": str(row[6] or ""),
+            "report_name": str(row[7] or ""),
+        }
+        for row in rows
+    ]
+
+
+def format_peer_host_mentions(
+    rows: Sequence[dict[str, Any]],
+    *,
+    hostname: str,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+) -> str:
+    window = ""
+    if start_time is not None or end_time is not None:
+        window = f" window={start_time or '...'} → {end_time or '...'}"
+    header = f"## Peer/cluster mentions of {hostname}{window}"
+    if not rows:
+        return (
+            f"{header}\n"
+            "No peer-host log lines mentioning this hostname were found in the "
+            "available SOS (or outside the boot gap). Local silence alone does not "
+            "prove BMC/manual reset."
+        )
+    lines = [
+        header,
+        "These lines were logged on OTHER ingested hosts and name this hostname.",
+        "Prefer quotes that describe an action against the host over guesses.",
+        "hostname|timestamp|level|message",
+    ]
+    for row in rows:
+        lines.append(
+            f"{row.get('hostname') or '-'}|{row.get('timestamp') or '-'}|"
+            f"{row.get('level') or '-'}|"
+            f"{truncate_text(redact_sensitive_text(str(row.get('message') or '')), 260)}"
+        )
+    return "\n".join(lines)
 
 
 def hostnames_mentioned_in_text(conn: Any, text: str) -> list[str]:
@@ -922,6 +1113,8 @@ def build_langchain_tools(conn: Any):
         FIRST tool for reboot/crash questions. Discover WHEN the host last booted
         from SOS data: journalctl --list-boots (preferred), then journalctl --boot
         bounds, then who -b / last / uptime / dmesg / hostnamectl.
+        Also searches OTHER ingested hosts in the boot gap for log lines that
+        mention this hostname (loss-of-contact / reboot / fence / evacuate).
         Pass hostname (short like comp008 or FQDN). Do this before compare_nodes
         or generic log searches. Do not treat user-session 'Reached target Shutdown'
         as a host reboot.
@@ -932,6 +1125,57 @@ def build_langchain_tools(conn: Any):
                     conn,
                     hostname,
                     limit=max(1, min(int(limit), 20)),
+                )
+            )
+
+    @tool
+    def search_peer_mentions(
+        hostname: str,
+        start_time: str = "",
+        end_time: str = "",
+        limit: int = 25,
+    ) -> str:
+        """
+        Search OTHER cluster hosts for log lines that mention this hostname.
+        Use after get_host_reboot_timeline when you need a wider or custom window,
+        or when the timeline peer section was empty. Do NOT set hostname on
+        search_os_logs for this — that only searches the host's own SOS.
+        Optional start_time/end_time as 'YYYY-MM-DD HH:MM:SS' (local SOS timestamps).
+        """
+        with db_lock:
+            start_dt = None
+            end_dt = None
+            if start_time.strip():
+                try:
+                    start_dt = datetime.fromisoformat(start_time.strip())
+                except ValueError:
+                    return f"Invalid start_time={start_time!r}; use YYYY-MM-DD HH:MM:SS"
+            if end_time.strip():
+                try:
+                    end_dt = datetime.fromisoformat(end_time.strip())
+                except ValueError:
+                    return f"Invalid end_time={end_time!r}; use YYYY-MM-DD HH:MM:SS"
+            hosts = resolve_hostnames(conn, hostname)
+            if not hosts:
+                return f"No cluster hostname matched {hostname!r}."
+            target = hosts[0]
+            rows = search_peer_host_mentions(
+                conn,
+                target,
+                start_time=start_dt,
+                end_time=end_dt,
+                limit=max(1, min(int(limit), 80)),
+            )
+            note = ""
+            if target.lower() != hostname.strip().lower():
+                note = f"(resolved hostname {hostname!r} → {target})\n"
+            return _safe_tool_output(
+                note
+                + format_peer_host_mentions(
+                    rows,
+                    hostname=target,
+                    start_time=start_dt,
+                    end_time=end_dt,
                 )
             )
 
@@ -1075,6 +1319,9 @@ def build_langchain_tools(conn: Any):
         Hostname may be short (comp008) or FQDN; it is resolved against cluster_nodes.
         For alternatives use OR, e.g. 'reboot OR panic OR watchdog'.
         For reboot/crash searches leave service empty.
+        For peer reactions about a host, use search_peer_mentions (or leave hostname
+        empty and put the hostname token in search_terms) — setting hostname here
+        only returns that host's own SOS logs.
         """
         with db_lock:
             capped = max(1, min(int(limit), 30))
@@ -1267,6 +1514,7 @@ def build_langchain_tools(conn: Any):
     return [
         create_and_run_analysis,
         get_host_reboot_timeline,
+        search_peer_mentions,
         get_cluster_overview,
         compare_nodes,
         get_entity_evidence,

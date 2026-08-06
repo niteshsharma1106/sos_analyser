@@ -89,16 +89,16 @@ Reasoning style (apply to every investigation):
 Investigation order:
 A) Host reboot / crash / panic / power / auto-reboot questions (HIGHEST PRIORITY):
    1. Call get_host_reboot_timeline with the hostname first → establish WHEN.
+      The timeline also includes Peer/cluster mentions from OTHER hosts in the
+      boot gap — read that section before concluding "unknown".
    2. On that host, search around the boot window for local OS crash evidence
       (panic/watchdog/oom/MCE/Hardware Error, abrupt halt). Leave service empty.
-   3. If local cause is missing or logs stop abruptly before boot:
-      - search OTHER cluster hosts (or leave hostname empty / use controller peers)
-        for the same window AND for the compute hostname / short name;
-      - look for contemporaneous loss-of-contact, reboot/termination/evacuate, or
-        peer reactions that reference this host;
-      - use create_and_run_analysis if you need a time-bounded cross-host query.
-   4. Answer: last boot time → evidenced cause (or unknown) → what remains open.
-      Cite hostnames and times. Do not fill gaps with unverified external-reset stories.
+   3. If local cause is missing: use the peer mentions already in the timeline
+      (or call search_peer_mentions with the boot-gap times). Do NOT set
+      hostname=<affected host> on search_os_logs when looking for peer reactions —
+      that only searches the host's own SOS and will miss controller/peer evidence.
+   4. Answer: last boot time → evidenced cause from quotes (or unknown) → open gaps.
+      Cite hostnames and times. Do not fill gaps with unverified BMC/external-reset stories.
 
 B) Other incidents:
    1) get_cluster_overview once if hostname/role is unclear.
@@ -859,17 +859,16 @@ def build_investigation_app(
             host_hint = hostname or "the compute hostname from the question"
             mission = (
                 "REBOOT MISSION (reason step-by-step; do not invent causes):\n"
-                f"1) Establish WHEN {host_hint} last booted "
-                "(get_host_reboot_timeline).\n"
-                "2) On that host, check the boot window for local OS crash evidence "
-                "(panic/watchdog/OOM/MCE/Hardware Error) or an abrupt log stop.\n"
-                "3) If local evidence does not explain the reboot: widen. Search other "
-                "ingested cluster hosts in the same window for mentions of this hostname "
-                "(short or FQDN) and for contemporaneous loss-of-contact / reboot / "
-                "evacuate / termination reactions. Use create_and_run_analysis if needed.\n"
-                "4) Final answer: boot time first, then only causes supported by quotes. "
-                "If still unknown, say what is missing — do not default to BMC/manual "
-                "external reset without positive evidence.\n"
+                f"1) Call get_host_reboot_timeline for {host_hint} — read WHEN and the "
+                "Peer/cluster mentions section (other hosts naming this hostname in the "
+                "boot gap).\n"
+                "2) Only if needed, check local crash signatures on that host.\n"
+                "3) If peer mentions are thin, call search_peer_mentions with the boot-gap "
+                "times. Never search peer reactions with hostname set to the affected host "
+                "(that only returns its own SOS).\n"
+                "4) Final answer: boot time first, then causes supported by quotes from "
+                "peer or local evidence. If still unknown, say what is missing — do not "
+                "default to BMC/manual external reset without positive evidence.\n"
             )
         else:
             mission = (
