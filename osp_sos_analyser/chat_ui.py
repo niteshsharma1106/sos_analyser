@@ -228,9 +228,8 @@ def _answer_question(
         if "model_not_found" in lower or "does not exist or you do not have access" in lower:
             return (
                 "The configured LLM model was rejected by the provider (model_not_found).\n\n"
-                "Check `OSP_SOS_MODEL` in `.env`.\n"
-                "For Groq Compound Mini use: `OSP_SOS_MODEL=groq/compound-mini`\n"
-                "Other Groq examples: `llama-3.3-70b-versatile`, `openai/gpt-oss-120b`.\n\n"
+                "Set `OSP_SOS_MODEL` in `.env` to the exact provider model id "
+                "(e.g. `groq/compound-mini`, `llama-3.3-70b-versatile`).\n\n"
                 f"Details: `{type(exc).__name__}: {exc}`"
             )
         return f"Investigation failed: `{type(exc).__name__}: {exc}`"

@@ -12,6 +12,7 @@ from osp_sos_analyser.langgraph_investigator import (
     ExpandedQuery,
     InvestigationEntities,
     INVESTIGATOR_SYSTEM_PROMPT,
+    _structured_expand_methods,
     _init_llm,
     _normalize_node_role,
     _parse_partial_expanded_json,
@@ -86,38 +87,12 @@ class LangGraphInvestigatorModuleTests(unittest.TestCase):
     def test_init_llm_requires_api_key(self) -> None:
         previous = {
             key: os.environ.pop(key, None)
-            for key in ("GROQ_API_KEY", "GROK_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY")
+            for key in ("GROQ_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY")
         }
         os.environ["OSP_SOS_SKIP_DOTENV"] = "1"
         try:
             with self.assertRaises(MissingLLMConfiguration):
                 _init_llm(model="llama-3.1-8b-instant", model_provider="groq")
-        finally:
-            os.environ.pop("OSP_SOS_SKIP_DOTENV", None)
-            for key, value in previous.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-
-    def test_init_llm_rejects_groq_model_on_google_provider(self) -> None:
-        previous = {
-            key: os.environ.pop(key, None)
-            for key in (
-                "GROQ_API_KEY",
-                "GROK_API_KEY",
-                "OPENAI_API_KEY",
-                "GOOGLE_API_KEY",
-                "OSP_SOS_MODEL",
-                "OSP_SOS_MODEL_PROVIDER",
-            )
-        }
-        os.environ["OSP_SOS_SKIP_DOTENV"] = "1"
-        os.environ["GOOGLE_API_KEY"] = "test-key"
-        try:
-            with self.assertRaises(MissingLLMConfiguration) as ctx:
-                _init_llm(model="openai/gpt-oss-120b", model_provider="google_genai")
-            self.assertIn("not a Google Gemini model", str(ctx.exception))
         finally:
             os.environ.pop("OSP_SOS_SKIP_DOTENV", None)
             for key, value in previous.items():
@@ -133,7 +108,6 @@ class LangGraphInvestigatorModuleTests(unittest.TestCase):
             key: os.environ.pop(key, None)
             for key in (
                 "GROQ_API_KEY",
-                "GROK_API_KEY",
                 "OPENAI_API_KEY",
                 "GOOGLE_API_KEY",
                 "OSP_SOS_MODEL",
@@ -168,7 +142,6 @@ class LangGraphInvestigatorModuleTests(unittest.TestCase):
             key: os.environ.pop(key, None)
             for key in (
                 "GROQ_API_KEY",
-                "GROK_API_KEY",
                 "OPENAI_API_KEY",
                 "GOOGLE_API_KEY",
                 "OSP_SOS_MODEL",
@@ -277,6 +250,30 @@ class ExpandedQueryHardeningTests(unittest.TestCase):
 
 
 class GroqToolCallRecoveryTests(unittest.TestCase):
+    def test_parse_function_tag_missing_separator_before_json(self) -> None:
+        # This is the exact malformed Groq failed_generation shape seen in chat.
+        failed = (
+            '<function=search_os_logs{"hostname": "comp008", '
+            '"search_terms": "panic OR watchdog OR oom", "limit": 100, '
+            '"service": ""}</function>'
+        )
+        parsed = parse_groq_failed_generation(failed)
+        self.assertEqual(
+            parsed,
+            (
+                "search_os_logs",
+                {
+                    "hostname": "comp008",
+                    "search_terms": "panic OR watchdog OR oom",
+                    "limit": 100,
+                    "service": "",
+                },
+            ),
+        )
+
+    def test_groq_expansion_does_not_retry_unsupported_json_schema(self) -> None:
+        self.assertEqual(_structured_expand_methods("groq"), ["json_mode"])
+
     def test_parse_function_tag_with_inline_args(self) -> None:
         failed = (
             '<function=search_os_logs({"hostname": "n1-wrkld1-b1-b12-comp008", '

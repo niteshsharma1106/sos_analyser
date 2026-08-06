@@ -129,6 +129,8 @@ _GROQ_FUNCTION_TAG_RE = re.compile(
     r">\s*</function>"  # empty body
     r"|"
     r"\s+(\{.*?\})\s*(?:></function>|</function>)?"  # name {...}
+    r"|"
+    r"(\{.*?\})\s*</function>"  # malformed name{"k": ...}</function>
     r")",
     re.DOTALL,
 )
@@ -349,6 +351,8 @@ def fallback_expanded_query(raw_query: str) -> ExpandedQuery:
                     "nova-compute",
                     "shutdown",
                     "power",
+                    "fenced",
+
                 )
                 if token in lower
             ),
@@ -360,13 +364,13 @@ def fallback_expanded_query(raw_query: str) -> ExpandedQuery:
         keywords = _clean_token_list(re.findall(r"[a-z0-9-]{3,}", lower)[:8], max_items=8, max_len=48)
 
     service = "system"
-    if any(w in lower for w in ("neutron", "ovn", "port binding", "chassis")):
+    if any(w in lower for w in ("neutron", "ovn", "port binding", "chassis", "ovs")):
         service = "neutron"
     elif any(w in lower for w in ("cinder", "volume")):
         service = "cinder"
     elif any(w in lower for w in ("glance", "image")):
         service = "glance"
-    elif any(w in lower for w in ("nova", "instance", "spawn", "vm ")) and "reboot" not in lower:
+    elif any(w in lower for w in ("nova", "instance", "spawn", "spin")) and "reboot" not in lower:
         service = "nova"
     elif any(w in lower for w in ("reboot", "kernel", "panic", "hardware", "power")):
         service = "system"
@@ -500,25 +504,20 @@ class InvestigationState(TypedDict, total=False):
     run_id: str
 
 
-def _normalize_provider(model_provider: str) -> str:
-    from .env_config import normalize_provider
-
-    return normalize_provider(model_provider)
-
-
 def _structured_expand_methods(model_provider: str | None = None) -> list[str]:
     """
-    Prefer native json_schema when available; Groq often rejects it unless the
-    model is on their structured-output allow-list, so fall back to json_mode.
+    Prefer native json_schema when available. Groq supports it only for a
+    subset of models, so use json_mode there and rely on the JSON fallback for
+    malformed completions.
     """
     from .env_config import get_llm_settings
 
     try:
-        provider = get_llm_settings(model_provider=model_provider).provider
+        provider = (model_provider or "").strip() or get_llm_settings().provider
     except Exception:
-        provider = _normalize_provider(model_provider or "")
+        provider = (model_provider or "").strip()
     if provider == "groq":
-        return ["json_mode", "json_schema"]
+        return ["json_mode"]
     return ["json_schema", "json_mode"]
 
 
@@ -571,7 +570,13 @@ def parse_groq_failed_generation(text: str) -> tuple[str, dict[str, Any]] | None
     match = _GROQ_FUNCTION_TAG_RE.search(blob)
     if match:
         name = match.group(1)
-        raw_args = match.group(2) or match.group(3) or match.group(4) or ""
+        raw_args = (
+            match.group(2)
+            or match.group(3)
+            or match.group(4)
+            or match.group(5)
+            or ""
+        )
         args = _extract_json_object(raw_args) or {}
         return name, args
 
