@@ -446,8 +446,11 @@ class InvestigationToolsTests(unittest.TestCase):
                 self.assertIn("11e3514c3a2e49148084a1e471fcded6", timeline)
                 self.assertIn("Last reboot / current boot start", timeline)
                 self.assertIn("Peer/cluster mentions", timeline)
+                self.assertIn("unexpectedly dropped during monitor", timeline)
                 self.assertIn("terminated (reboot)", timeline)
                 self.assertIn(ctrl, timeline)
+                peer_lines = [line for line in timeline.splitlines() if ctrl in line]
+                self.assertIn(host, peer_lines[0])
                 self.assertNotIn("ipmitool", timeline.lower())
 
                 tools = {tool.name: tool for tool in build_langchain_tools(conn)}

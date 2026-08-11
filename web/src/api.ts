@@ -14,6 +14,7 @@ export type ChatSettings = {
   include_graph: boolean;
   answer_style: string;
   show_observability: boolean;
+  engine: "linear" | "planner";
 };
 
 export type BootstrapResponse = {

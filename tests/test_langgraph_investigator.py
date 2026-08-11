@@ -16,6 +16,7 @@ from osp_sos_analyser.langgraph_investigator import (
     _init_llm,
     _normalize_node_role,
     _parse_partial_expanded_json,
+    _reboot_timeline_evidence_excerpt,
     extract_groq_failed_tool_call,
     fallback_expanded_query,
     invoke_tool_by_name,
@@ -28,6 +29,22 @@ from osp_sos_analyser.llm_client import MissingLLMConfiguration
 
 
 class LangGraphInvestigatorModuleTests(unittest.TestCase):
+    def test_reboot_excerpt_keeps_trigger_and_fence_action(self) -> None:
+        output = "\n".join(
+            [
+                "## Last reboot / boot timeline for rack-comp008",
+                "Last reboot / current boot start: 2026-07-27 02:38:27",
+                "Previous boot ended: 2026-07-27 02:34:06",
+                *[f"metadata {i}" for i in range(100)],
+                "ctrl|error: Remote connection to rack-comp008 unexpectedly dropped during monitor",
+                "ctrl|notice: Operation 'reboot' targeting rack-comp008: OK (complete)",
+            ]
+        )
+        excerpt = _reboot_timeline_evidence_excerpt(output)
+        self.assertIn("02:38:27", excerpt)
+        self.assertIn("unexpectedly dropped", excerpt)
+        self.assertIn("Operation 'reboot'", excerpt)
+
     def test_investigator_prompt_prefers_reasoning_over_hardcoded_reboot_cause(self) -> None:
         prompt = INVESTIGATOR_SYSTEM_PROMPT
         self.assertIn("widen the search", prompt.lower())
@@ -188,6 +205,30 @@ class LangGraphInvestigatorModuleTests(unittest.TestCase):
 
 
 class ExpandedQueryHardeningTests(unittest.TestCase):
+    def test_time_window_string_is_coerced_to_relative_window(self) -> None:
+        plan = ExpandedQuery.model_validate(
+            {
+                "summary": "Compute node reboot",
+                "intent": "investigate reboot",
+                "entities": {"hostname": "comp008", "node_role": "compute"},
+                "time_window": "last 24 hours",
+            }
+        )
+        self.assertEqual(plan.time_window.relative, "last 24 hours")
+
+    def test_search_query_string_is_coerced_to_search_task(self) -> None:
+        plan = ExpandedQuery.model_validate(
+            {
+                "summary": "Compute node reboot",
+                "intent": "investigate reboot",
+                "entities": {"hostname": "comp008", "node_role": "compute"},
+                "search_queries": ["pacemaker OR fence OR reboot"],
+            }
+        )
+        self.assertEqual(len(plan.search_queries), 1)
+        self.assertEqual(plan.search_queries[0].service, "system")
+        self.assertEqual(plan.search_queries[0].query, "pacemaker OR fence OR reboot")
+
     def test_normalize_node_role_salvages_keyword_dump(self) -> None:
         dump = (
             "compute-node-auto-rebooted-unexpectedly-analyze-it-root-cause-"

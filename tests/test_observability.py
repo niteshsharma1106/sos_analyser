@@ -32,6 +32,22 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("get_cluster_overview", markdown)
         self.assertIn("node_start", markdown)
 
+    def test_handoff_records_format_size_and_redacted_preview(self) -> None:
+        trace = AgentRunTrace(run_id="handoff-test")
+        trace.handoff(
+            "QUERY_EXPAND",
+            "INVESTIGATOR",
+            {"plan": {"hostname": "comp008"}, "digest": "token=secret-value"},
+        )
+        event = trace.events[0]
+        self.assertEqual(event.kind, "handoff")
+        self.assertEqual(event.details["format"], "JSON object")
+        self.assertGreater(event.details["total_chars"], 0)
+        self.assertGreater(event.details["total_bytes_utf8"], 0)
+        self.assertIn("comp008", event.details["fields"]["plan"]["preview"])
+        self.assertNotIn("secret-value", event.details["fields"]["digest"]["preview"])
+        self.assertIn("Inter-agent handoffs", trace.render_markdown())
+
     def test_configure_logging_writes_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "osp_sos.log"

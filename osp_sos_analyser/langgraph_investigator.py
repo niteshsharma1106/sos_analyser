@@ -32,12 +32,26 @@ CRITICAL RULES (follow exactly):
 - `entities.node_role` MUST be exactly one of: controller | compute | storage | unknown
   NEVER put keywords, log phrases, or hyphenated dumps into node_role.
 - `entities.hostname` is the node hostname from the incident (full name preferred), ≤ 64 chars, or null.
-- `entities.service` may be: nova, cinder, neutron, glance, keystone, heat, octavia, ironic, system, or unknown.
+- `entities.service` may be: nova, cinder, neutron, glance, keystone, heat, octavia, ironic, system, rabbitmq, pacemaker, pcs, chronosync or unknown.
 - Use `system` for host reboots, kernel, hardware, or OS-level symptoms.
 - `keywords`: 3–12 short lowercase tokens (hostnames, UUIDs, error words). Each ≤ 48 chars.
-- `investigation_targets`: 2–8 short labels (e.g. "system", "kernel", "nova-compute"). Each ≤ 48 chars.
-- `search_queries`: at most 5 items; each query string ≤ 120 chars.
+- `investigation_targets`: 2–8 short labels based on the investigation (for example: "system", "kernel", "nova-compute"). Each ≤ 48 chars.
+- `search_queries`: at most 5 objects. Every object MUST contain:
+  `service` (for example "system"), `objective` (what to find),
+  `query` (the search text), and `priority` (1–10).
+    Example:
+    "search_queries": [
+    {{
+        "service": "system",
+        "objective": "Find evidence preceding the compute reboot",
+        "query": "comp008 reboot panic watchdog",
+        "priority": 1
+    }}
+    ]
 - `hypotheses`: at most 5 short strings.
+- `time_window`: either null, or an object with optional `start`, `end`, or
+  `relative` fields. Use `{{"relative": "last 24 hours"}}` when exact timestamps
+  are unavailable; never return a bare string.
 - Do NOT invent long keyword chains. Do NOT repeat the same phrase.
 - Prefer null over inventing entities.
 - Output must be valid, complete JSON that fits in a small response.
@@ -254,6 +268,12 @@ class InvestigationEntities(BaseModel):
 class TimeWindow(BaseModel):
     start: Optional[str] = Field(default=None, max_length=64)
     end: Optional[str] = Field(default=None, max_length=64)
+    relative: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("start", "end", "relative", mode="before")
+    @classmethod
+    def _clip_time_fields(cls, value: Any) -> Any:
+        return _clip_str(value, 64)
 
 
 class SearchTask(BaseModel):
@@ -281,6 +301,38 @@ class ExpandedQuery(BaseModel):
     investigation_targets: List[str] = Field(default_factory=list, max_length=12)
     hypotheses: List[str] = Field(default_factory=list, max_length=5)
     time_window: Optional[TimeWindow] = Field(default=None)
+
+    @field_validator("search_queries", mode="before")
+    @classmethod
+    def _normalize_search_queries(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return []
+
+        normalized = []
+        for item in value[:5]:
+            if isinstance(item, str):
+                query = _clip_str(item, 160)
+                if query:
+                    normalized.append(
+                        {
+                            "service": "system",
+                            "objective": "Search incident evidence",
+                            "query": query,
+                            "priority": 1,
+                        }
+                    )
+            elif isinstance(item, dict):
+                normalized.append(item)
+        return normalized
+
+    @field_validator("time_window", mode="before")
+    @classmethod
+    def _normalize_time_window(cls, value: Any) -> Any:
+        """Preserve legacy LLM values such as ``"last 24 hours"``."""
+        if isinstance(value, str):
+            relative = _clip_str(value, 64)
+            return {"relative": relative} if relative else None
+        return value
 
     @field_validator("summary", "intent", mode="before")
     @classmethod
@@ -379,11 +431,11 @@ def fallback_expanded_query(raw_query: str) -> ExpandedQuery:
     if service != "system":
         targets.append(service)
     if "reboot" in lower or "panic" in lower:
-        targets.extend(["kernel", "journal", "nova-compute"])
+        targets.extend(["kernel", "journal", "nova-compute", "pacemaker", "audit", "message"])
     if hostname:
         targets.append(hostname)
 
-    summary = truncate_text(text.replace("\n", " "), 160) or "Investigate OpenStack incident"
+    summary = truncate_text(text.replace("\n", " "), 500) or "Investigate OpenStack incident"
     return ExpandedQuery(
         summary=summary,
         intent="investigate_incident",
@@ -391,7 +443,7 @@ def fallback_expanded_query(raw_query: str) -> ExpandedQuery:
             resource_id=uuids[0] if uuids else None,
             resource_type="host" if hostname and service == "system" else None,
             service=service,
-            problem=truncate_text(text.replace("\n", " "), 120),
+            problem=truncate_text(text.replace("\n", " "), 500),
             hostname=hostname,
             node_role=node_role or ("compute" if hostname and hostname.lower().startswith("comp") else None),
         ),
@@ -482,13 +534,36 @@ def _parse_partial_expanded_json(text: str, raw_query: str) -> ExpandedQuery:
             if isinstance(data, dict):
                 data.setdefault("keywords", [])
                 data.setdefault("investigation_targets", [])
-                data.setdefault("summary", truncate_text(raw_query, 160) or "Investigate")
+                data.setdefault("summary", truncate_text(raw_query, 500) or "Investigate")
                 data.setdefault("intent", "investigate_incident")
                 data.setdefault("entities", {})
                 return sanitize_expanded_query(data, raw_query)
         except Exception:
             continue
     return fallback_expanded_query(raw_query)
+
+
+def _expanded_query_parse_diagnostic(completion: Any) -> str:
+    """Return a concise reason a structured expansion completion was rejected."""
+    text = str(completion or "").strip()
+    start = text.find("{")
+    if start < 0:
+        return "No JSON object was present in the provider completion."
+    text = text[start:]
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return f"Invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+    try:
+        ExpandedQuery.model_validate(payload)
+    except Exception as exc:
+        errors = getattr(exc, "errors", lambda: [])()
+        if errors:
+            first = errors[0]
+            location = ".".join(str(part) for part in first.get("loc", ()))
+            return f"Schema validation failed at {location}: {first.get('msg', str(exc))}"
+        return f"Schema validation failed: {type(exc).__name__}: {exc}"
+    return "JSON and ExpandedQuery validation succeeded; inspect provider parser settings/version."
 
 
 class InvestigationState(TypedDict, total=False):
@@ -651,9 +726,11 @@ def is_groq_tool_use_failed(exc: BaseException) -> bool:
 
 def invoke_tool_by_name(tools: list[Any], name: str, args: dict[str, Any] | None = None) -> str:
     """Invoke a LangChain tool by name; returns a string digest or error text."""
+    log = get_logger("Invoking Tool")
     args = args or {}
     tool_map = {getattr(tool, "name", ""): tool for tool in tools}
     tool = tool_map.get(name)
+    log.info("[Invoking Tool]: Invoking tool %r with args %s", name, args)
     if tool is None:
         available = ", ".join(sorted(k for k in tool_map if k)) or "(none)"
         return f"Unknown tool {name!r}. Available: {available}"
@@ -689,6 +766,91 @@ def _evidence_from_agent_messages(messages: list[Any]) -> list[dict[str, Any]]:
             )
     return gathered
 
+
+def _reboot_timeline_evidence_excerpt(output: str, *, max_lines: int = 8) -> str:
+    """Keep the causal reboot chain when a timeline is passed to synthesis.
+
+    Tool output begins with boot metadata, so a simple character truncation can
+    drop the peer monitor failure and the later fence completion.
+    """
+    text = str(output or "")
+    host_match = re.search(r"^## Last reboot / boot timeline for ([^\n(]+)", text, re.MULTILINE)
+    target = host_match.group(1).strip().lower() if host_match else ""
+    selected: list[str] = []
+    for line in text.splitlines():
+        lowered = line.lower()
+        if (
+            "last reboot / current boot start" in lowered
+            or "previous boot ended" in lowered
+            or (
+                (not target or target in lowered)
+                and any(
+                    phrase in lowered
+                    for phrase in (
+                        "unexpectedly dropped during monitor",
+                        "lost connection to remote executor",
+                        "state is now lost",
+                        "operation 'reboot' targeting",
+                        "was terminated (reboot)",
+                        "was unfenced",
+                    )
+                )
+            )
+        ):
+            selected.append(line)
+            if len(selected) >= max_lines:
+                break
+    return "\n".join(selected) or truncate_text(text, 2400)
+
+
+def synthesize_rca_text(
+    *,
+    plan: "ExpandedQuery",
+    evidence_text: str,
+    investigator_notes: str,
+    raw_query: str,
+    prefetch: str = "",
+    hypotheses: list[str] | None = None,
+    llm,
+    run_trace: "AgentRunTrace",
+) -> str:
+    """Shared RCA synthesis step. Used by both the linear investigator graph
+    and the planner/analysis-designer graph so the prompt only lives once."""
+    from langchain_core.runnables import RunnableConfig
+
+    rca_prompt = f"""
+Original user question: {raw_query or plan.summary}
+Interpreted request: {plan.summary}
+Hypotheses considered: {hypotheses if hypotheses is not None else getattr(plan, "hypotheses", [])}
+Prefetched cluster/evidence digest:
+{prefetch or 'None'}
+Investigator's working notes: {investigator_notes}
+Evidence gathered:
+{evidence_text}
+
+Answer the user's actual request directly. Do not force an RCA format for an
+inventory, count, list, relationship, or summary question: state the requested
+result first and use the evidence only to qualify it. Cite hostnames and entity
+IDs when possible.
+If this is a reboot/crash question: state the last boot/reboot time first (or say
+it could not be determined). Prefer causes supported by direct quotes from tools.
+If the host's own logs lack a crash signature, weigh peer/controller evidence from
+the same window that names this host. Do not invent BMC/manual/"external reset"
+explanations without positive evidence — say unknown and what to check next.
+Separate facts from hypotheses. If evidence is weak, say so.
+"""
+    synth_cb = AgentObservabilityCallback(run_trace, stage="synthesize")
+    result = llm.invoke(
+        rca_prompt,
+        config=RunnableConfig(callbacks=[synth_cb.handler]),
+    )
+    content = getattr(result, "content", result)
+    run_trace.add(
+        "rca",
+        "Synthesized root cause analysis",
+        details={"chars": len(str(content))},
+    )
+    return str(content)
 
 def build_investigation_app(
     db_con,
@@ -761,10 +923,23 @@ def build_investigation_app(
                 ) or getattr(exc, "text", None)
                 if completion:
                     salvage_completions.append(completion)
+                diagnostic_completion = completion or str(exc)
+                log.warning(
+                    "Structured expand via %s parse diagnosis: %s",
+                    method,
+                    _expanded_query_parse_diagnostic(diagnostic_completion),
+                )
+                # Keep the full (redacted) provider payload available only when
+                # debug logging is enabled; the normal warning stays compact.
+                log.debug(
+                    "Structured expand via %s raw completion: %s",
+                    method,
+                    truncate_text(redact_sensitive_text(str(diagnostic_completion)), 8000),
+                )
                 log.warning(
                     "Structured expand via %s failed (%s)",
                     method,
-                    truncate_text(f"{type(exc).__name__}: {exc}", 180),
+                    truncate_text(f"{type(exc).__name__}: {exc}", 500),
                 )
                 continue
 
@@ -772,7 +947,7 @@ def build_investigation_app(
             parse_error = f"{type(last_exc).__name__}: {last_exc}"
             log.warning(
                 "Structured expand failed (%s); attempting salvage/fallback",
-                truncate_text(parse_error, 200),
+                truncate_text(parse_error, 500),
             )
             # The first JSON-mode call can contain a useful partial plan even if a
             # later json_schema retry is rejected by the provider. Salvage in order.
@@ -795,7 +970,7 @@ def build_investigation_app(
             run_trace.add(
                 "plan_fallback",
                 "Used salvage/fallback ExpandedQuery after parse failure",
-                details={"error": truncate_text(parse_error, 240)},
+                details={"error": truncate_text(parse_error, 500)},
             )
 
         assert result is not None
@@ -831,7 +1006,15 @@ def build_investigation_app(
         run_trace.add(
             "prefetch",
             "Built cluster/evidence prefetch digest",
-            details={"chars": len(digest), "preview": truncate_text(digest, 240)},
+            details={"chars": len(digest), "preview": truncate_text(digest, 500)},
+        )
+        run_trace.handoff(
+            "QUERY_EXPAND",
+            "INVESTIGATOR",
+            {
+                "expanded_plan": result,
+                "prefetch_digest": digest,
+            },
         )
         run_trace.node_end("QUERY_EXPAND")
         return {
@@ -892,6 +1075,39 @@ def build_investigation_app(
         investigator_raw = ""
         user_message = base_user_message
 
+        # A reboot RCA has one non-negotiable first evidence-collection step.
+        # Prompting alone is not enforcement: a model can answer from prefetch
+        # without making a native tool call, producing an incomplete RCA.
+        if rebootish and hostname:
+            required_name = "get_host_reboot_timeline"
+            required_args = {"hostname": hostname}
+            run_trace.tool_start(required_name, required_args)
+            required_output = invoke_tool_by_name(tools, required_name, required_args)
+            run_trace.tool_end(required_name, required_output)
+            gathered_evidence.append(
+                {
+                    "service": "system",
+                    "source": required_name,
+                    "summary": str(required_args),
+                    "raw_logs": _reboot_timeline_evidence_excerpt(required_output),
+                }
+            )
+            user_message += (
+                "\nRequired evidence already collected:\n"
+                f"[{required_name}] {truncate_text(required_output, 2400)}\n"
+                "Do not repeat that exact call. Determine whether a local crash-signature "
+                "or wider peer search is needed to explain the trigger.\n"
+            )
+
+        run_trace.handoff(
+            "INVESTIGATOR_ORCHESTRATOR",
+            "INVESTIGATOR_AGENT",
+            {
+                "mission": mission,
+                "agent_input": user_message,
+            },
+        )
+
         for attempt in range(_MAX_GROQ_TOOL_RECOVERIES + 1):
             last_messages: list[Any] = []
             try:
@@ -917,7 +1133,20 @@ def build_investigation_app(
                     ]
                     gathered_evidence = merged + gathered_from_agent
                 else:
-                    gathered_evidence = gathered_from_agent
+                    # Preserve the deterministic reboot baseline even when the
+                    # agent itself makes no calls.
+                    if gathered_evidence:
+                        existing = {
+                            (item.get("source"), item.get("summary"))
+                            for item in gathered_from_agent
+                        }
+                        gathered_evidence = [
+                            item
+                            for item in gathered_evidence
+                            if (item.get("source"), item.get("summary")) not in existing
+                        ] + gathered_from_agent
+                    else:
+                        gathered_evidence = gathered_from_agent
                 for item in gathered_evidence:
                     tool_name = str(item.get("source") or "tool")
                     if not any(
@@ -956,7 +1185,7 @@ def build_investigation_app(
                         run_trace.add(
                             "tool_recovery_exhausted",
                             "Continuing with recovered evidence after Groq tool_use_failed",
-                            details={"error": truncate_text(str(exc), 240)},
+                            details={"error": truncate_text(str(exc), 500)},
                         )
                         investigator_raw = (
                             f"Investigator stopped after Groq tool-call error: "
@@ -993,6 +1222,13 @@ def build_investigation_app(
                     + "\n\n".join(recovered_digests)
                     + "\n\nContinue with other tools if needed, then conclude."
                 )
+                run_trace.handoff(
+                    "INVESTIGATOR_ORCHESTRATOR",
+                    "INVESTIGATOR_AGENT_RETRY",
+                    {
+                        "agent_input": user_message,
+                    },
+                )
 
         run_trace.add(
             "investigator_summary",
@@ -1019,37 +1255,24 @@ def build_investigation_app(
             if evidence
             else "No tool evidence was gathered."
         )
-        rca_prompt = f"""
-    Original user question: {state.get('raw_query', plan.summary)}
-    Interpreted request: {plan.summary}
-    Hypotheses considered: {plan.hypotheses}
-    Prefetched cluster/evidence digest:
-    {prefetch or 'None'}
-    Investigator's working notes: {investigator_notes}
-    Evidence gathered:
-    {evidence_text}
-
-    Answer the user's actual request directly. Do not force an RCA format for an
-    inventory, count, list, relationship, or summary question: state the requested
-    result first and use the evidence only to qualify it. Cite hostnames and entity
-    IDs when possible.
-    If this is a reboot/crash question: state the last boot/reboot time first (or say
-    it could not be determined). Prefer causes supported by direct quotes from tools.
-    If the host's own logs lack a crash signature, weigh peer/controller evidence from
-    the same window that names this host. Do not invent BMC/manual/"external reset"
-    explanations without positive evidence — say unknown and what to check next.
-    Separate facts from hypotheses. If evidence is weak, say so.
-    """
-        synth_cb = AgentObservabilityCallback(run_trace, stage="synthesize")
-        result = llm.invoke(
-            rca_prompt,
-            config=RunnableConfig(callbacks=[synth_cb.handler]),
+        run_trace.handoff(
+            "INVESTIGATOR",
+            "SYNTHESIZE_RCA",
+            {
+                "expanded_plan": plan,
+                "prefetch_digest": prefetch,
+                "investigator_notes": investigator_notes,
+                "evidence_text": evidence_text,
+            },
         )
-        content = getattr(result, "content", result)
-        run_trace.add(
-            "rca",
-            "Synthesized root cause analysis",
-            details={"chars": len(str(content))},
+        content = synthesize_rca_text(
+            plan=plan,
+            evidence_text=evidence_text,
+            investigator_notes=investigator_notes,
+            raw_query=state.get("raw_query", plan.summary),
+            prefetch=prefetch,
+            llm=llm,
+            run_trace=run_trace,
         )
         run_trace.node_end("SYNTHESIZE_RCA")
         return {
@@ -1125,7 +1348,7 @@ def investigate_with_langgraph(
 
     run_trace = trace or AgentRunTrace(prompt=enriched)
     run_trace.add("run_start", "Starting LangGraph investigation", details={"db_path": str(db_path)})
-    log.info("Investigation start run=%s prompt=%s", run_trace.run_id[:8], truncate_text(enriched, 120))
+    log.info("Investigation start run=%s prompt=%s", run_trace.run_id[:8], truncate_text(enriched, 500))
 
     try:
         with DatabaseConnector(db_path, read_only=True) as db:

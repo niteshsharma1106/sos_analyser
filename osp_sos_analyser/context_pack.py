@@ -6,8 +6,8 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-DIGEST_MESSAGE_CHARS = 180
-DIGEST_OUTPUT_CHARS = 220
+DIGEST_MESSAGE_CHARS = 500
+DIGEST_OUTPUT_CHARS = 500
 DEFAULT_PREFETCH_LIMIT = 20
 UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"

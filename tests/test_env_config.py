@@ -17,6 +17,7 @@ class EnvConfigTests(unittest.TestCase):
                 "GROQ_API_KEY",
                 "OPENAI_API_KEY",
                 "GOOGLE_API_KEY",
+                "OLLAMA_API_KEY",
                 "OSP_SOS_MODEL",
                 "OSP_SOS_MODEL_PROVIDER",
                 "OSP_SOS_SKIP_DOTENV",
@@ -93,6 +94,16 @@ class EnvConfigTests(unittest.TestCase):
         self.assertEqual(settings.api_key_env, "GROQ_API_KEY")
         self.assertEqual(settings.api_key, "unified-secret")
         self.assertEqual(os.environ.get("GROQ_API_KEY"), "unified-secret")
+
+    def test_ollama_does_not_require_an_api_key(self) -> None:
+        os.environ["OSP_SOS_MODEL"] = "llama3.2"
+        os.environ["OSP_SOS_MODEL_PROVIDER"] = "ollama"
+
+        settings = get_llm_settings()
+
+        self.assertEqual(settings.provider, "ollama")
+        self.assertEqual(settings.api_key_env, "OLLAMA_API_KEY")
+        self.assertEqual(settings.api_key, "")
 
     def test_empty_override_keeps_env_values(self) -> None:
         os.environ["OSP_SOS_MODEL"] = "openai/gpt-oss-120b"

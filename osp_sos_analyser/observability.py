@@ -71,7 +71,7 @@ class AgentRunTrace:
             event.elapsed_ms,
             kind,
             message,
-            truncate_text(detail_text, 500),
+            truncate_text(detail_text),
         )
         return event
 
@@ -100,6 +100,28 @@ class AgentRunTrace:
 
     def llm_end(self, stage: str, **details: Any) -> None:
         self.add("llm_end", f"LLM done ({stage})", details=_safe_details(details))
+
+    def handoff(
+        self,
+        source: str,
+        destination: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Record the redacted shape, size, and preview of an agent handoff."""
+        snapshot = {
+            str(key): _handoff_value(value)
+            for key, value in payload.items()
+        }
+        self.add(
+            "handoff",
+            f"{source} → {destination}",
+            details={
+                "format": "JSON object",
+                "fields": snapshot,
+                "total_chars": sum(item["chars"] for item in snapshot.values()),
+                "total_bytes_utf8": sum(item["bytes_utf8"] for item in snapshot.values()),
+            },
+        )
 
     def error(self, message: str, **details: Any) -> None:
         self.add("error", message, details=_safe_details(details), level=logging.ERROR)
@@ -157,6 +179,19 @@ class AgentRunTrace:
             for event in tool_calls:
                 args = event.details.get("args") or {}
                 lines.append(f"- `{event.message}` args=`{truncate_text(str(args), 160)}`")
+        handoffs = [e for e in self.events if e.kind == "handoff"]
+        if handoffs:
+            lines.extend(["", "### Inter-agent handoffs"])
+            for event in handoffs:
+                details = json.dumps(event.details, default=str, ensure_ascii=False, indent=2)
+                lines.extend(
+                    [
+                        f"#### +{event.elapsed_ms}ms — {event.message}",
+                        "```json",
+                        details,
+                        "```",
+                    ]
+                )
         return "\n".join(lines)
 
 
@@ -172,6 +207,25 @@ def _safe_details(details: dict[str, Any]) -> dict[str, Any]:
         else:
             cleaned[key] = truncate_text(str(value), 400)
     return cleaned
+
+
+def _handoff_value(value: Any) -> dict[str, Any]:
+    """Serialize a handoff value for trace inspection without retaining raw secrets."""
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    try:
+        rendered = json.dumps(value, default=str, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        rendered = str(value)
+    redacted = redact_sensitive_text(rendered)
+    preview_limit = max(100, int(os.getenv("OSP_SOS_HANDOFF_PREVIEW_CHARS", "2000")))
+    return {
+        "format": "json",
+        "chars": len(redacted),
+        "bytes_utf8": len(redacted.encode("utf-8")),
+        "preview": truncate_text(redacted, preview_limit),
+        "truncated": len(redacted) > preview_limit,
+    }
 
 
 class AgentObservabilityCallback:

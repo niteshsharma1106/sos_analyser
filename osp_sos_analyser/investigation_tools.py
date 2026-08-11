@@ -117,13 +117,17 @@ _ISO_BOOT_TS_RE = re.compile(r"(20\d{2}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})")
 # Rank peer reactions that commonly explain a host reboot (generic, not product-specific).
 _PEER_REACTION_RANK_SQL = """
 CASE
-  WHEN lower(message) LIKE '%terminated%' THEN 0
-  WHEN lower(message) LIKE '%fence%' OR lower(message) LIKE '%stonith%' THEN 1
-  WHEN lower(message) LIKE '% was reboot%' OR lower(message) LIKE '%(reboot)%' THEN 2
-  WHEN lower(message) LIKE '%state is now lost%' OR lower(message) LIKE '% unexpectedly dropped%' THEN 3
-  WHEN lower(message) LIKE '%evacuate%' THEN 4
-  WHEN lower(message) LIKE '%monitor%' AND lower(message) LIKE '%error%' THEN 5
-  ELSE 6
+  -- Put the failure that caused fencing before the fencing completion. A small
+  -- tool-result budget must retain both the trigger and the action.
+  WHEN lower(message) LIKE '%unexpectedly dropped during monitor%'
+       OR lower(message) LIKE '%lost connection to remote executor%' THEN 0
+  WHEN lower(message) LIKE '%state is now lost%' THEN 1
+  WHEN lower(message) LIKE '%terminated%' THEN 2
+  WHEN lower(message) LIKE '%fence%' OR lower(message) LIKE '%stonith%' THEN 3
+  WHEN lower(message) LIKE '% was reboot%' OR lower(message) LIKE '%(reboot)%' THEN 4
+  WHEN lower(message) LIKE '%evacuate%' THEN 5
+  WHEN lower(message) LIKE '%monitor%' AND lower(message) LIKE '%error%' THEN 6
+  ELSE 7
 END
 """
 
@@ -821,6 +825,10 @@ def search_peer_host_mentions(
     mention_sql = " OR ".join("message ILIKE ?" for _ in tokens)
     clauses.append(f"({mention_sql})")
     params.extend(f"%{token}%" for token in tokens)
+    # A short suffix such as comp008 can also match identically numbered hosts
+    # in other racks. Keep the fully resolved hostname first when it is present,
+    # while retaining suffix matches as useful surrounding-cluster context.
+    params.append(f"%{target}%")
     params.append(max(1, min(int(limit), 80)))
 
     rows = conn.execute(
@@ -830,6 +838,7 @@ def search_peer_host_mentions(
         FROM os_logs
         WHERE {' AND '.join(clauses)}
         ORDER BY
+          CASE WHEN message ILIKE ? THEN 0 ELSE 1 END,
           {_PEER_REACTION_RANK_SQL},
           timestamp NULLS LAST
         LIMIT ?

@@ -12,7 +12,9 @@ from osp_sos_analyser.llm_client import MissingLLMConfiguration
 from osp_sos_analyser.langgraph_investigator import (
     investigate_with_langgraph,
     render_investigation_result,
+
 )
+from osp_sos_analyser.planner_graph import investigate_with_planner_graph
 from osp_sos_analyser.chat_ui import launch_chat
 from osp_sos_analyser.observability import configure_logging, get_logger
 from osp_sos_analyser.privacy import redact_sensitive_text
@@ -102,6 +104,16 @@ def build_analyze_parser() -> argparse.ArgumentParser:
         help="Use the old deterministic search workflow without an LLM.",
     )
     parser.add_argument(
+        "--engine",
+        choices=["linear", "planner"],
+        default="linear",
+        help=(
+            "Investigation engine: 'linear' (default; expand -> agent-loop -> "
+            "synthesize) or 'planner' (plan/act -> analysis-designer with "
+            "static+read-only SQL validation -> evidence graph -> replan)."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default=None,
         help="Backend log level (default OSP_SOS_LOG_LEVEL or INFO)",
@@ -125,6 +137,12 @@ def build_chat_parser() -> argparse.ArgumentParser:
         "--offline",
         action="store_true",
         help="Default the UI to offline deterministic mode",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["linear", "planner"],
+        default="linear",
+        help="Default chat investigation engine",
     )
     parser.add_argument(
         "--model",
@@ -162,13 +180,20 @@ def main() -> None:
         else:
             try:
                 safe_prompt = redact_sensitive_text(args.prompt)
-                log.info("Analyze prompt=%s", safe_prompt)
+                log.info("Analyze prompt=%s engine=%s", safe_prompt, args.engine)
                 print(f"User Prompt: {safe_prompt}")
-                result = investigate_with_langgraph(
-                    db_path=args.db_path,
-                    prompt=args.prompt,
-                    model=args.model,
-                )
+                if args.engine == "planner":
+                    result = investigate_with_planner_graph(
+                        db_path=args.db_path,
+                        prompt=args.prompt,
+                        model=args.model,
+                    )
+                else:
+                    result = investigate_with_langgraph(
+                        db_path=args.db_path,
+                        prompt=args.prompt,
+                        model=args.model,
+                    )
             except MissingLLMConfiguration as exc:
                 raise SystemExit(str(exc)) from exc
             print(render_investigation_result(result, include_observability=True))
@@ -179,6 +204,7 @@ def main() -> None:
         launch_chat(
             db_path=args.db_path,
             offline=args.offline,
+            engine=args.engine,
             model=args.model,
             host=args.host,
             port=args.port,

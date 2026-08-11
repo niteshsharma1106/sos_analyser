@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import duckdb
 from fastapi import FastAPI
@@ -19,6 +19,7 @@ from .langgraph_investigator import (
     investigate_with_langgraph,
     render_investigation_result,
 )
+from .planner_graph import investigate_with_planner_graph
 from .llm_client import MissingLLMConfiguration
 from .observability import configure_logging, get_logger
 from .privacy import redact_sensitive_text
@@ -144,6 +145,7 @@ def _answer_question(
     include_graph: bool = True,
     answer_style: str = "Concise RCA",
     show_observability: bool = True,
+    engine: Literal["linear", "planner"] = "linear",
 ) -> str:
     del history  # reserved for future multi-turn context
     log = get_logger("chat")
@@ -162,8 +164,9 @@ def _answer_question(
     banner = _cluster_banner(db)
     prefix = f"{banner}\n\n" if banner else ""
     log.info(
-        "Chat question offline=%s graph=%s style=%s focus=%s prompt=%s",
+        "Chat question offline=%s engine=%s graph=%s style=%s focus=%s prompt=%s",
         offline,
+        engine,
         include_graph,
         answer_style,
         focus_entity or "-",
@@ -180,15 +183,23 @@ def _answer_question(
                     body = body + "\n\n" + graph
             return prefix + body
 
-        result = investigate_with_langgraph(
-            db_path=db,
-            prompt=prompt,
-            # Model/provider/API key always come from `.env` (optional CLI --model only).
-            model=(model or "").strip() or None,
-            focus_entity=focus_entity.strip() or None,
-            answer_style=answer_style,
-            include_graph=include_graph,
-        )
+        if engine == "planner":
+            result = investigate_with_planner_graph(
+                db_path=db,
+                prompt=prompt,
+                # Model/provider/API key always come from `.env` (optional CLI --model only).
+                model=(model or "").strip() or None,
+            )
+        else:
+            result = investigate_with_langgraph(
+                db_path=db,
+                prompt=prompt,
+                # Model/provider/API key always come from `.env` (optional CLI --model only).
+                model=(model or "").strip() or None,
+                focus_entity=focus_entity.strip() or None,
+                answer_style=answer_style,
+                include_graph=include_graph,
+            )
         return prefix + render_investigation_result(
             result,
             include_observability=show_observability,
@@ -244,6 +255,7 @@ class AskRequest(BaseModel):
     include_graph: bool = True
     answer_style: str = "Concise RCA"
     show_observability: bool = False
+    engine: Literal["linear", "planner"] = "linear"
 
 
 class AskResponse(BaseModel):
@@ -258,6 +270,7 @@ class ChatDefaults(BaseModel):
     include_graph: bool = True
     answer_style: str = "Concise RCA"
     show_observability: bool = False
+    engine: Literal["linear", "planner"] = "linear"
 
 
 class BootstrapResponse(BaseModel):
@@ -272,6 +285,7 @@ def build_chat_app(
     default_db_path: str = DEFAULT_DB_PATH,
     default_offline: bool = False,
     default_model: str | None = None,
+    default_engine: Literal["linear", "planner"] = "linear",
 ) -> FastAPI:
     """Build the FastAPI app that serves the React UI and investigation API."""
     load_app_env()
@@ -298,6 +312,7 @@ def build_chat_app(
                 db_path=default_db_path,
                 offline=default_offline,
                 model=env_model,
+                engine=default_engine,
             ),
             examples=DEFAULT_EXAMPLES,
         )
@@ -316,6 +331,7 @@ def build_chat_app(
             payload.include_graph,
             payload.answer_style,
             payload.show_observability,
+            payload.engine,
         )
         return AskResponse(answer=answer)
 
@@ -347,6 +363,7 @@ def launch_chat(
     *,
     db_path: str = DEFAULT_DB_PATH,
     offline: bool = False,
+    engine: Literal["linear", "planner"] = "linear",
     model: str | None = None,
     host: str = "127.0.0.1",
     port: int = 7860,
@@ -359,17 +376,19 @@ def launch_chat(
 
     configure_logging(level=log_level, log_file=log_file)
     get_logger("chat").info(
-        "Launching React chat UI db=%s host=%s port=%s offline=%s",
+        "Launching React chat UI db=%s host=%s port=%s offline=%s engine=%s",
         db_path,
         host,
         port,
         offline,
+        engine,
     )
 
     app = build_chat_app(
         default_db_path=db_path,
         default_offline=offline,
         default_model=model,
+        default_engine=engine,
     )
     get_logger("chat").info("Open http://%s:%s in your browser", host, port)
     uvicorn.run(app, host=host, port=port, log_level="info")
@@ -382,6 +401,12 @@ def main(argv: list[str] | None = None) -> None:
         "--offline",
         action="store_true",
         help="Default the UI to offline deterministic mode",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["linear", "planner"],
+        default="linear",
+        help="Default chat investigation engine",
     )
     parser.add_argument("--model", default=None, help="Optional model override")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
@@ -405,6 +430,7 @@ def main(argv: list[str] | None = None) -> None:
     launch_chat(
         db_path=args.db_path,
         offline=args.offline,
+        engine=args.engine,
         model=args.model,
         host=args.host,
         port=args.port,

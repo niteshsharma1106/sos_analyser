@@ -13,6 +13,7 @@ _PROVIDER_API_KEY_ENV = {
     "google_genai": "GOOGLE_API_KEY",
     "google_vertexai": "GOOGLE_API_KEY",
     "groq": "GROQ_API_KEY",
+    "ollama": "OLLAMA_API_KEY",
 }
 
 _UNIFIED_API_KEY_ENV = "OSP_SOS_API_KEY"
@@ -25,6 +26,7 @@ _LLM_DOTENV_KEYS = (
     "GROQ_API_KEY",
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
+    "OLLAMA_API_KEY",
 )
 
 
@@ -199,7 +201,7 @@ def get_llm_settings(
       - OSP_SOS_MODEL
       - OSP_SOS_MODEL_PROVIDER
       - provider API key (GOOGLE_API_KEY / GROQ_API_KEY / OPENAI_API_KEY)
-        or unified OSP_SOS_API_KEY
+        or unified OSP_SOS_API_KEY. A local Ollama server does not need a key.
 
     Values are used as written — no provider/model rewriting.
     Optional ``model`` / ``model_provider`` only override when non-empty (CLI).
@@ -234,7 +236,7 @@ def get_llm_settings(
 
     _apply_unified_api_key()
     api_key = (os.getenv(api_key_env) or "").strip()
-    if not api_key:
+    if not api_key and provider != "ollama":
         raise MissingLLMConfiguration(
             f"Provider '{provider}' requires {api_key_env} in your `.env` file "
             f"(or set {_UNIFIED_API_KEY_ENV}).\n"
@@ -261,8 +263,11 @@ def init_chat_model_from_env(
     kwargs: dict = {
         "model": settings.model,
         "model_provider": settings.provider,
-        "api_key": settings.api_key,
     }
+    # Local Ollama normally runs without authentication. Avoid passing an
+    # explicit empty key because provider adapters may treat it as a credential.
+    if settings.api_key:
+        kwargs["api_key"] = settings.api_key
     if settings.provider in {"groq", "openai"}:
         kwargs["http_client"] = build_httpx_client()
     return init_chat_model(**kwargs)

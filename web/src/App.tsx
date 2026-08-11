@@ -37,6 +37,7 @@ export default function App() {
     include_graph: true,
     answer_style: "Concise RCA",
     show_observability: false,
+    engine: "linear",
   });
 
   const listRef = useRef<HTMLDivElement>(null);
@@ -226,6 +227,24 @@ export default function App() {
               }
             />
             <label htmlFor="offline">Offline mode (no LLM)</label>
+          </div>
+
+          <div className="field">
+            <label htmlFor="engine">Investigation engine</label>
+            <select
+              id="engine"
+              value={settings.engine}
+              disabled={settings.offline}
+              onChange={(e) =>
+                setSettings((s) => ({
+                  ...s,
+                  engine: e.target.value as "linear" | "planner",
+                }))
+              }
+            >
+              <option value="linear">Linear</option>
+              <option value="planner">Planner</option>
+            </select>
           </div>
 
           <div className="field">
