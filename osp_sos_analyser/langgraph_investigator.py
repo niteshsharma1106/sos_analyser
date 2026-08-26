@@ -1074,7 +1074,9 @@ def build_investigation_app(
             f"the boot timeline is at the top):\n{prefetch}\n"
         )
         agent_cb = AgentObservabilityCallback(run_trace, stage="investigator")
-        config = RunnableConfig(callbacks=[agent_cb.handler])
+        config = RunnableConfig(
+            callbacks=[agent_cb.handler],
+            recursion_limit=8,)
 
         gathered_evidence: list[dict[str, Any]] = []
         recovered_digests: list[str] = []
