@@ -8,6 +8,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import uuid
 from collections import deque
 from dataclasses import replace
 from datetime import timedelta
@@ -20,6 +21,7 @@ from .archive_reader import (
     file_size_limit,
     is_interesting_command_member,
     is_interesting_log_member,
+    is_config_member,
     is_systemd_journal_member,
     iter_report_archives,
     iter_text_lines,
@@ -41,6 +43,8 @@ from .db import (
     archive_already_ingested,
     dedupe_ingested_rows,
     ensure_schema,
+    create_report_set,
+    insert_configs,
     insert_commands,
     insert_logs,
     mark_archive_completed,
@@ -52,7 +56,8 @@ from .db import (
 from .evidence_index import build_evidence_index
 from .relationship_graph import build_relationship_index
 from .log_parser import parse_log_lines
-from .models import CommandArtifact, IngestionStats, LogEntry
+from .models import CommandArtifact, ConfigArtifact, IngestionStats, LogEntry
+from .privacy import redact_sensitive_text
 
 BATCH_SIZE = 1000
 HASH_CHUNK_SIZE = 8 * 1024 * 1024
@@ -70,6 +75,8 @@ def _with_identity(entry: LogEntry, manifest: NodeManifest) -> LogEntry:
         hostname=manifest.hostname,
         node_role=manifest.node_role,
         cluster_id=manifest.cluster_id,
+        report_set_id=manifest.report_set_id,
+        node_id=manifest.node_id,
         rhosp_version=manifest.rhosp_version or entry.rhosp_version,
     )
 
@@ -95,6 +102,40 @@ def _command_artifact(
         hostname=manifest.hostname,
         node_role=manifest.node_role,
         cluster_id=manifest.cluster_id,
+        report_set_id=manifest.report_set_id,
+        node_id=manifest.node_id,
+    )
+
+
+def _config_artifact(
+    source_file: str,
+    content: str,
+    report_name: str,
+    manifest: NodeManifest,
+) -> ConfigArtifact:
+    service, category = classify_service(Path(source_file).name, source_file)
+    suffix = Path(source_file).suffix.lower()
+    config_format = {
+        ".conf": "ini",
+        ".ini": "ini",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".json": "json",
+        ".env": "env",
+    }.get(suffix, "text")
+    return ConfigArtifact(
+        source_file=source_file,
+        content=redact_sensitive_text(content),
+        service=service,
+        category=category,
+        config_format=config_format,
+        report_name=report_name,
+        rhosp_version=manifest.rhosp_version,
+        hostname=manifest.hostname,
+        node_role=manifest.node_role,
+        cluster_id=manifest.cluster_id,
+        report_set_id=manifest.report_set_id,
+        node_id=manifest.node_id,
     )
 
 
@@ -127,16 +168,21 @@ def _ingest_archive(
     *,
     archive_id: str,
     cluster_id: str,
+    report_set_id: str,
 ) -> IngestionStats:
     stats = IngestionStats(archives=1)
     report_name = archive_path.name
     command_batch: list[CommandArtifact] = []
+    config_batch: list[ConfigArtifact] = []
     log_index = 0
     command_index = 0
     members_seen = 0
     last_heartbeat = time.perf_counter()
     manifest = new_node_manifest(
-        archive_path, archive_id=archive_id, cluster_id=cluster_id
+        archive_path,
+        archive_id=archive_id,
+        cluster_id=cluster_id,
+        report_set_id=report_set_id,
     )
 
     print(f"[progress] {report_name}: walking archive stream", flush=True)
@@ -202,6 +248,24 @@ def _ingest_archive(
                 stats = stats.add(IngestionStats(log_files=1, log_rows=rows))
                 continue
 
+            if is_config_member(member, max_file_size):
+                source_file = normalized_member_name(member)
+                note_service_from_path(manifest, source_file)
+                content = (
+                    manifest_text
+                    if manifest_text is not None
+                    else read_text_member(archive, member)
+                )
+                config_batch.append(
+                    _config_artifact(source_file, content, report_name, manifest)
+                )
+                if len(config_batch) >= BATCH_SIZE:
+                    flushed = insert_configs(conn, config_batch)
+                    stats = stats.add(IngestionStats(config_rows=flushed))
+                    config_batch.clear()
+                stats = stats.add(IngestionStats(config_files=1))
+                continue
+
             if is_interesting_command_member(member, max_file_size):
                 command_index += 1
                 source_file = normalized_member_name(member)
@@ -231,10 +295,12 @@ def _ingest_archive(
                     command_batch.clear()
 
     command_rows = insert_commands(conn, command_batch)
+    config_rows = insert_configs(conn, config_batch)
     stats = stats.add(
         IngestionStats(
             command_files=command_index,
             command_rows=command_rows,
+            config_rows=config_rows,
         )
     )
     finalize_node_identity(manifest)
@@ -244,6 +310,8 @@ def _ingest_archive(
         hostname=manifest.hostname,
         node_role=manifest.node_role,
         cluster_id=manifest.cluster_id,
+        report_set_id=manifest.report_set_id,
+        node_id=manifest.node_id,
         rhosp_version=manifest.rhosp_version,
     )
     upsert_cluster_node(conn, manifest.as_row())
@@ -255,7 +323,8 @@ def _ingest_archive(
     )
     print(
         f"[progress] {report_name}: finished archive: {stats.log_files} log file(s), "
-        f"{stats.command_files} command artifact(s), {members_seen} archive member(s) scanned",
+        f"{stats.command_files} command artifact(s), {stats.config_files} config file(s), "
+        f"{members_seen} archive member(s) scanned",
         flush=True,
     )
     return stats
@@ -615,6 +684,8 @@ def ingest_sos_reports(
         if clear_existing:
             conn.execute("DELETE FROM os_logs")
             conn.execute("DELETE FROM os_commands")
+            conn.execute("DELETE FROM os_configs")
+            conn.execute("DELETE FROM sos_report_sets")
             conn.execute("DELETE FROM ingested_reports")
             conn.execute("DELETE FROM cluster_nodes")
             conn.execute("DELETE FROM entities")
@@ -625,6 +696,8 @@ def ingest_sos_reports(
             conn, root, clear_existing=clear_existing, explicit=cluster_id
         )
         print(f"[progress] Cluster id: {resolved_cluster_id}", flush=True)
+        report_set_id = str(uuid.uuid4())
+        report_set_registered = False
 
         for archive_index, archive_path in enumerate(archive_paths, start=1):
             print(
@@ -645,6 +718,10 @@ def ingest_sos_reports(
                 f"{archive_path.name}",
                 flush=True,
             )
+            if not report_set_registered:
+                create_report_set(conn, report_set_id, resolved_cluster_id, root)
+                print(f"[progress] Report set id: {report_set_id}", flush=True)
+                report_set_registered = True
             mark_archive_started(conn, archive_id, archive_path)
             try:
                 archive_stats = _ingest_archive(
@@ -655,12 +732,14 @@ def ingest_sos_reports(
                     large_log_tail_hours,
                     archive_id=archive_id,
                     cluster_id=resolved_cluster_id,
+                    report_set_id=report_set_id,
                 )
-                removed_logs, removed_commands = dedupe_ingested_rows(conn)
-                if removed_logs or removed_commands:
+                removed_logs, removed_commands, removed_configs = dedupe_ingested_rows(conn)
+                if removed_logs or removed_commands or removed_configs:
                     print(
-                        f"[dedupe] Removed {removed_logs} duplicate log row(s) and "
-                        f"{removed_commands} duplicate command row(s)",
+                        f"[dedupe] Removed {removed_logs} duplicate log row(s), "
+                        f"{removed_commands} duplicate command row(s), and "
+                        f"{removed_configs} duplicate config row(s)",
                         flush=True,
                     )
                 mark_archive_completed(
@@ -680,7 +759,7 @@ def ingest_sos_reports(
         if repaired:
             print(
                 f"[progress] Repaired node_role for {repaired} cluster node(s) "
-                "(e.g. ...-comp008 → compute)",
+                "(e.g. ...-cmp008 → compute)",
                 flush=True,
             )
         print(
@@ -704,7 +783,8 @@ def ingest_sos_reports(
 
     print(
         "[progress] Ingestion complete: "
-        f"{total.log_rows} log row(s), {total.command_rows} command row(s)",
+        f"{total.log_rows} log row(s), {total.command_rows} command row(s), "
+        f"{total.config_rows} config row(s)",
         flush=True,
     )
     return db_target

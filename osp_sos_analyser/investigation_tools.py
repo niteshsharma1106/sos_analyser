@@ -714,7 +714,7 @@ def format_command_rows(rows: Sequence[dict[str, Any]]) -> str:
             f"{row.get('hostname') or '-'}|{row.get('command') or '-'}|"
             f"{row.get('source_file') or '-'}|{row.get('service') or '-'}"
         )
-        output = truncate_text(str(row.get("output") or ""), 1200)
+        output = truncate_text(str(row.get("output") or ""), 600)
         blocks.append(header + "\n" + output)
     return "\n\n".join(blocks)
 
@@ -1049,9 +1049,21 @@ def build_langchain_tools(conn: Any):
 
     db_lock = threading.RLock()
 
+    MAX_TOOL_OUTPUT_CHARS = 8000
+
     def _safe_tool_output(value: object) -> str:
-        """Tool results are model-visible; never return common credentials."""
-        return redact_sensitive_text(value)
+        """Tool results are model-visible; never return common credentials, and
+           never exceed a bounded size — the agent loop keeps every past tool result
+           in history, so an unbounded single call can blow the context window."""
+        text = redact_sensitive_text(value)
+        if len(text) > MAX_TOOL_OUTPUT_CHARS:
+            omitted = len(text) - MAX_TOOL_OUTPUT_CHARS
+            text = (
+                text[:MAX_TOOL_OUTPUT_CHARS]
+                + f"\n...[truncated, {omitted} more chars — narrow search_terms, "
+                "hostname, or the time window and try again]"
+            )
+        return text
 
     reboot_term_re = re.compile(
         r"\b(reboot|panic|watchdog|oom|shutdown|mce|hardware error|kernel)\b",
@@ -1085,9 +1097,11 @@ def build_langchain_tools(conn: Any):
         entity_relationships(src_entity_id, src_entity_type, relation_type,
         dst_entity_id, dst_entity_type, evidence_count, confidence, first_seen,
         last_seen, hostnames, services, sample_excerpt, sample_hostname,
-        sample_service, sample_level); os_logs(..., hostname, node_role, service,
+        sample_service, sample_level); os_logs(..., cluster_id, report_set_id, node_id,
+        hostname, node_role, service,
         level, timestamp, message); os_commands(..., hostname, node_role, command,
-        output).
+        output); os_configs(cluster_id, report_set_id, node_id, node_name, node_role,
+        config_path, config_content, config_format, service, category, report_name).
 
         Example: to count instances observed on a host, count distinct src_entity_id
         from entity_relationships where relation_type='instance_host' and
@@ -1325,7 +1339,7 @@ def build_langchain_tools(conn: Any):
         """
         Fallback raw log search with optional hostname/node_role scope.
         Prefer get_entity_evidence when you have a UUID/req-id.
-        Hostname may be short (comp008) or FQDN; it is resolved against cluster_nodes.
+        Hostname may be short (comp008 or cmp01 or cmp001) or FQDN; it is resolved against cluster_nodes.
         For alternatives use OR, e.g. 'reboot OR panic OR watchdog'.
         For reboot/crash searches leave service empty.
         For peer reactions about a host, use search_peer_mentions (or leave hostname
@@ -1464,6 +1478,58 @@ def build_langchain_tools(conn: Any):
             return _safe_tool_output(note + format_command_rows(rows))
 
     @tool
+    def search_sos_configs(
+        cluster_id: str = "",
+        hostname: str = "",
+        config_path: str = "",
+        search_terms: str = "",
+        report_set_id: str = "",
+        limit: int = 10,
+    ) -> str:
+        """Search ingested /etc configuration evidence. Use cluster_id to isolate one
+        cluster; optionally scope to hostname, config path, a report-set snapshot, or
+        text such as a setting name/value. Secret values are redacted."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if cluster_id.strip():
+            clauses.append("cluster_id = ?")
+            params.append(cluster_id.strip())
+        if hostname.strip():
+            clauses.append("lower(node_name) = lower(?)")
+            params.append(hostname.strip())
+        if config_path.strip():
+            clauses.append("config_path ILIKE ?")
+            params.append(f"%{config_path.strip()}%")
+        if search_terms.strip():
+            clauses.append("config_content ILIKE ?")
+            params.append(f"%{search_terms.strip()}%")
+        if report_set_id.strip():
+            clauses.append("report_set_id = ?")
+            params.append(report_set_id.strip())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(int(limit), 20)))
+        with db_lock:
+            rows = conn.execute(
+                f"""
+                SELECT cluster_id, report_set_id, node_name, config_path, config_content
+                FROM os_configs
+                {where}
+                ORDER BY node_name, config_path
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        if not rows:
+            return "No ingested configuration files matched."
+        return _safe_tool_output( 
+            "\n\n".join(
+                f"cluster={row[0]} report_set={row[1]} host={row[2]}\n"
+                f"file={row[3]}\n{truncate_text(str(row[4] or ''), 2000)}"
+                for row in rows
+            )
+        )
+
+    @tool
     def get_related_entities(
         entity_id: str,
         relation_type: str = "",
@@ -1532,4 +1598,5 @@ def build_langchain_tools(conn: Any):
         list_indexed_entities,
         search_os_logs,
         search_sos_commands,
+        search_sos_configs,
     ]

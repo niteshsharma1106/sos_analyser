@@ -1,9 +1,9 @@
 # cluster_loader.py — Layer 0: cluster / node identity from SOS archives.
 from __future__ import annotations
 
-import hashlib
 import re
 import tarfile
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,6 +61,8 @@ class NodeManifest:
     rhosp_version: str = "17.x"
     services: set[str] = field(default_factory=set)
     cluster_id: str = ""
+    report_set_id: str = ""
+    node_id: str = ""
 
     def as_row(self) -> tuple[object, ...]:
         return (
@@ -71,6 +73,8 @@ class NodeManifest:
             ",".join(sorted(self.services)) if self.services else "",
             self.archive_name,
             self.archive_id,
+            self.report_set_id,
+            self.node_id,
         )
 
 
@@ -132,6 +136,10 @@ def repair_node_roles(conn: Any) -> int:
                 "UPDATE os_commands SET node_role = ? WHERE lower(hostname) = lower(?)",
                 [inferred, host],
             )
+            conn.execute(
+                "UPDATE os_configs SET node_role = ? WHERE lower(node_name) = lower(?)",
+                [inferred, host],
+            )
         except Exception:
             pass
         updated += 1
@@ -179,6 +187,12 @@ def finalize_node_identity(manifest: NodeManifest) -> None:
         manifest.node_role = inferred
     elif not manifest.node_role:
         manifest.node_role = "unknown"
+    manifest.node_id = node_id_for(manifest.cluster_id, manifest.hostname)
+
+
+def node_id_for(cluster_id: str, hostname: str) -> str:
+    """Return a stable node ID for a hostname within one cluster."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"osp-sos/{cluster_id}/{hostname.lower()}"))
 
 
 def apply_manifest_text(manifest: NodeManifest, source_file: str, text: str) -> None:
@@ -243,17 +257,9 @@ def resolve_cluster_id(
 ) -> str:
     if explicit:
         return explicit
-    if not clear_existing:
-        try:
-            row = conn.execute(
-                "SELECT cluster_id FROM cluster_nodes WHERE cluster_id IS NOT NULL LIMIT 1"
-            ).fetchone()
-            if row and row[0]:
-                return str(row[0])
-        except Exception:
-            pass
-    digest = hashlib.sha256(str(reports_dir.resolve()).encode("utf-8")).hexdigest()
-    return digest[:16]
+    # A missing explicit ID must never merge this ingestion into an unrelated
+    # cluster already present in the database.
+    return f"cluster-{uuid.uuid4()}"
 
 
 def new_node_manifest(
@@ -261,6 +267,7 @@ def new_node_manifest(
     *,
     archive_id: str,
     cluster_id: str,
+    report_set_id: str,
 ) -> NodeManifest:
     hostname = guess_hostname_from_archive_name(archive_path.name)
     return NodeManifest(
@@ -269,6 +276,8 @@ def new_node_manifest(
         hostname=hostname,
         node_role=infer_node_role(hostname, archive_path.name),
         cluster_id=cluster_id,
+        report_set_id=report_set_id,
+        node_id=node_id_for(cluster_id, hostname),
     )
 
 

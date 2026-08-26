@@ -65,7 +65,7 @@ _HOSTNAME_RE = re.compile(
     r"\b("
     r"[A-Za-z0-9][A-Za-z0-9._-]{3,60}?(?:comp|ctrl|ceph|compute|controller)\d+[A-Za-z0-9._-]*"
     r"|"
-    r"(?:ctrl|comp|compute|controller|ceph|storage|wrkld|node)[\w.-]*\d[\w.-]*"
+    r"(?:ctrl|comp|compute|controller|ceph|storage|wrkld|node|ctl|cmp)[\w.-]*\d[\w.-]*"
     r")\b",
     re.IGNORECASE,
 )
@@ -119,7 +119,13 @@ B) Other incidents:
    2) get_entity_evidence for UUID/req-id/hostname.
    3) compare_nodes when multi-node contrast helps.
    4) get_related_entities / get_operation_path for relationship/path questions.
-   5) search_os_logs / list_indexed_entities / create_and_run_analysis as needed.
+   5) For configuration questions, use search_sos_configs. If logs suggest a
+      configuration cause, you MUST call search_sos_configs before claiming a
+      setting is missing, incorrect, or overridden. Cite the node, config path,
+      and observed setting; if no matching configuration is available, label the
+      configuration cause as unconfirmed rather than presenting it as the cause.
+   6) Otherwise use search_os_logs / list_indexed_entities /
+      create_and_run_analysis as needed.
 
 C) Inventory / count / list / summary questions:
    1) Answer from the entity and relationship snapshot, not incident-RCA tools.

@@ -5,7 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from osp_sos_analyser.archive_reader import is_interesting_command_member
+from osp_sos_analyser.archive_reader import (
+    is_interesting_command_member,
+    is_interesting_log_member,
+)
 from osp_sos_analyser.db import MAX_COMMAND_OUTPUT_CHARS, ensure_schema, insert_commands
 from osp_sos_analyser.ingest import (
     ingest_sos_reports,
@@ -16,6 +19,16 @@ from osp_sos_analyser.models import CommandArtifact
 
 
 class CommandFilterAndInsertTests(unittest.TestCase):
+    def test_keeps_active_and_latest_rotated_container_logs_only(self) -> None:
+        active = tarfile.TarInfo("var/log/containers/glance/glance-api.log")
+        latest = tarfile.TarInfo("var/log/containers/glance/glance-api.log.1.gz")
+        older = tarfile.TarInfo("var/log/containers/glance/glance-api.log.2.gz")
+        for member in (active, latest, older):
+            member.size = 1024
+        self.assertTrue(is_interesting_log_member(active, max_file_size=10_000_000))
+        self.assertTrue(is_interesting_log_member(latest, max_file_size=10_000_000))
+        self.assertFalse(is_interesting_log_member(older, max_file_size=10_000_000))
+
     def test_skips_pacemaker_crm_report_message_extracts(self) -> None:
         info = tarfile.TarInfo(
             "sos_commands/pacemaker/crm_report/host/messages.extract.txt"
@@ -154,6 +167,56 @@ class JournalDecodeHelperTests(unittest.TestCase):
 
 
 class IngestSosReportsTests(unittest.TestCase):
+    def test_ingests_configs_with_cluster_report_set_and_node_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            reports_dir = tmp_path / "SOS_REPORTS"
+            reports_dir.mkdir()
+            archive_path = reports_dir / "sosreport-ctl01-2026-07-28.tar.xz"
+            with tarfile.open(archive_path, "w:xz") as archive:
+                members = {
+                    "etc/nova/nova.conf": b"[database]\nconnection = mysql+pymysql://nova:secret@db/nova\n",
+                    "etc/hostname": b"ctl01\n",
+                    "var/log/messages": b"Jul 28 14:05:01 ctl01 kernel: config test\n",
+                }
+                for name, payload in members.items():
+                    info = tarfile.TarInfo(name)
+                    info.size = len(payload)
+                    archive.addfile(info, fileobj=__import__("io").BytesIO(payload))
+
+            db_path = tmp_path / "test.duckdb"
+            ingest_sos_reports(
+                reports_dir=reports_dir,
+                db_path=db_path,
+                clear_existing=True,
+                cluster_id="cluster-1",
+            )
+
+            import duckdb
+
+            with duckdb.connect(str(db_path)) as conn:
+                config = conn.execute(
+                    "SELECT cluster_id, report_set_id, node_id, node_name, config_path, "
+                    "config_content, service FROM os_configs "
+                    "WHERE config_path = 'etc/nova/nova.conf'"
+                ).fetchone()
+                log_identity = conn.execute(
+                    "SELECT cluster_id, report_set_id, node_id, hostname FROM os_logs"
+                ).fetchone()
+                report_sets = conn.execute(
+                    "SELECT cluster_id, report_set_id FROM sos_report_sets"
+                ).fetchall()
+
+            self.assertEqual(config[0], "cluster-1")
+            self.assertTrue(config[1])
+            self.assertTrue(config[2])
+            self.assertEqual(config[3], "ctl01")
+            self.assertNotIn("secret", config[5])
+            self.assertIn("[REDACTED]", config[5])
+            self.assertEqual(config[6], "nova")
+            self.assertEqual(log_identity, (config[0], config[1], config[2], "ctl01"))
+            self.assertEqual(report_sets, [("cluster-1", config[1])])
+
     def test_parses_decoded_binary_journal_output(self) -> None:
         entries = list(
             parse_log_lines(

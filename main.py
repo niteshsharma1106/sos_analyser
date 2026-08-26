@@ -55,6 +55,11 @@ def build_ingest_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--db-path", default=None, help="Destination DuckDB file path")
     parser.add_argument(
+        "--cluster-id",
+        default=None,
+        help="Cluster identifier for this SOS-report set; a new UUID is created when omitted",
+    )
+    parser.add_argument(
         "--clear-existing",
         action="store_true",
         help="Clear prior ingested rows before loading",
@@ -228,6 +233,7 @@ def main() -> None:
         force_reingest=args.force_reingest,
         large_log_threshold_mb=args.large_log_threshold_mb,
         large_log_tail_hours=args.large_log_tail_hours,
+        cluster_id=args.cluster_id,
     )
     print(f"Ingestion complete. Database: {db_path}")
 

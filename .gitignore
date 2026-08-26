@@ -16,7 +16,6 @@ sos_analysis.*
 *.duckdb
 *.log
 *.wal
-
 # Frontend
 web/node_modules/
 web/dist/

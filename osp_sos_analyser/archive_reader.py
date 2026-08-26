@@ -240,6 +240,21 @@ def is_interesting_log_member(
         SCAN_STATS.interesting_logs += 1
         return True
 
+    # Containerized RHOSP services can use service names not present in the
+    # phase-one token list (for example glance, keystone, or custom sidecars).
+    # Retain the active log and only the latest compressed rotation; older
+    # rotations add volume without contributing the recent SOS evidence.
+    if "/var/log/containers/" in f"/{name.lower()}":
+        if LOW_VALUE_REGEX.search(name):
+            SCAN_STATS.skipped_pattern += 1
+            return False
+        base_name = PurePosixPath(name).name.lower()
+        if base_name.endswith(".log") or base_name.endswith(".log.1.gz"):
+            SCAN_STATS.interesting_logs += 1
+            return True
+        SCAN_STATS.skipped_extension += 1
+        return False
+
     if not _has_supported_extension(name):
         return False
 
@@ -289,6 +304,14 @@ def is_interesting_command_member(
 
     SCAN_STATS.interesting_commands += 1
     return True
+
+
+def is_config_member(member: tarfile.TarInfo, max_size: int) -> bool:
+    """Return whether a regular SOS /etc capture should be retained as config evidence."""
+    if not _valid_regular_file(member, max_size):
+        return False
+    name = normalized_member_name(member).lower()
+    return "/etc/" in f"/{name}"
 
 
 # -----------------------------------------------------------------------------

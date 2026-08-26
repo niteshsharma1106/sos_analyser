@@ -20,6 +20,8 @@ class LogEntry:
     hostname: str = ""
     node_role: str = ""
     cluster_id: str = ""
+    report_set_id: str = ""
+    node_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,24 @@ class CommandArtifact:
     hostname: str = ""
     node_role: str = ""
     cluster_id: str = ""
+    report_set_id: str = ""
+    node_id: str = ""
+
+
+@dataclass(frozen=True)
+class ConfigArtifact:
+    source_file: str
+    content: str
+    service: str
+    category: str
+    config_format: str
+    report_name: str
+    rhosp_version: str = "17.x"
+    hostname: str = ""
+    node_role: str = ""
+    cluster_id: str = ""
+    report_set_id: str = ""
+    node_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -45,6 +65,8 @@ class IngestionStats:
     log_rows: int = 0
     command_files: int = 0
     command_rows: int = 0
+    config_files: int = 0
+    config_rows: int = 0
 
     def add(self, other: "IngestionStats") -> "IngestionStats":
         return IngestionStats(
@@ -53,6 +75,8 @@ class IngestionStats:
             log_rows=self.log_rows + other.log_rows,
             command_files=self.command_files + other.command_files,
             command_rows=self.command_rows + other.command_rows,
+            config_files=self.config_files + other.config_files,
+            config_rows=self.config_rows + other.config_rows,
         )
 
 

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import duckdb
 
-from .models import CommandArtifact, LogEntry
+from .models import CommandArtifact, ConfigArtifact, LogEntry
 
 NULL_VALUE = r"\N"
 DEFAULT_MAX_LINE_SIZE = 100_000_000
@@ -106,7 +106,9 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             rhosp_version TEXT,
             hostname TEXT,
             node_role TEXT,
-            cluster_id TEXT
+            cluster_id TEXT,
+            report_set_id TEXT,
+            node_id TEXT
         )
         """
     )
@@ -124,7 +126,9 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             rhosp_version TEXT,
             hostname TEXT,
             node_role TEXT,
-            cluster_id TEXT
+            cluster_id TEXT,
+            report_set_id TEXT,
+            node_id TEXT
         )
         """
     )
@@ -153,7 +157,37 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             rhosp_version TEXT,
             services TEXT,
             archive_name TEXT,
-            archive_id TEXT
+            archive_id TEXT,
+            report_set_id TEXT,
+            node_id TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sos_report_sets (
+            report_set_id TEXT,
+            cluster_id TEXT,
+            reports_dir TEXT,
+            ingested_at TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS os_configs (
+            cluster_id TEXT,
+            report_set_id TEXT,
+            node_id TEXT,
+            node_name TEXT,
+            node_role TEXT,
+            config_path TEXT,
+            config_content TEXT,
+            config_format TEXT,
+            service TEXT,
+            category TEXT,
+            report_name TEXT,
+            rhosp_version TEXT
         )
         """
     )
@@ -216,9 +250,15 @@ def _ensure_legacy_columns(conn: duckdb.DuckDBPyConnection) -> None:
         ("os_logs", "hostname"),
         ("os_logs", "node_role"),
         ("os_logs", "cluster_id"),
+        ("os_logs", "report_set_id"),
+        ("os_logs", "node_id"),
         ("os_commands", "hostname"),
         ("os_commands", "node_role"),
         ("os_commands", "cluster_id"),
+        ("os_commands", "report_set_id"),
+        ("os_commands", "node_id"),
+        ("cluster_nodes", "report_set_id"),
+        ("cluster_nodes", "node_id"),
     ):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} TEXT")
 
@@ -233,14 +273,32 @@ def ensure_indexes(conn: duckdb.DuckDBPyConnection) -> None:
     )
     conn.execute(
         """
+        CREATE INDEX IF NOT EXISTS idx_os_logs_cluster_node
+        ON os_logs(cluster_id, node_id)
+        """
+    )
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_os_logs_timestamp
         ON os_logs(timestamp)
         """
     )
     conn.execute(
         """
+        CREATE INDEX IF NOT EXISTS idx_os_commands_cluster_node
+        ON os_commands(cluster_id, node_id)
+        """
+    )
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_os_logs_report_name
         ON os_logs(report_name)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_os_configs_cluster_node_path
+        ON os_configs(cluster_id, node_id, config_path)
         """
     )
     conn.execute(
@@ -301,21 +359,20 @@ def ensure_indexes(conn: duckdb.DuckDBPyConnection) -> None:
 
 def upsert_cluster_node(conn: duckdb.DuckDBPyConnection, row: Sequence[object]) -> None:
     """Replace any prior row for the same archive_id/hostname in this cluster."""
-    cluster_id, hostname, _node_role, _version, _services, archive_name, archive_id = row
+    cluster_id, hostname, _node_role, _version, _services, archive_name, archive_id, report_set_id, _node_id = row
     conn.execute(
         """
         DELETE FROM cluster_nodes
-        WHERE archive_id = ? OR (cluster_id = ? AND archive_name = ?)
-           OR (cluster_id = ? AND hostname = ? AND hostname != '')
+        WHERE archive_id = ? OR (report_set_id = ? AND hostname = ? AND hostname != '')
         """,
-        [archive_id, cluster_id, archive_name, cluster_id, hostname],
+        [archive_id, report_set_id, hostname],
     )
     conn.execute(
         """
         INSERT INTO cluster_nodes (
             cluster_id, hostname, node_role, rhosp_version, services,
-            archive_name, archive_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            archive_name, archive_id, report_set_id, node_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         list(row),
     )
@@ -328,6 +385,8 @@ def stamp_report_identity(
     hostname: str,
     node_role: str,
     cluster_id: str,
+    report_set_id: str,
+    node_id: str,
     rhosp_version: str,
 ) -> None:
     """Backfill identity columns for one archive after manifest is finalized."""
@@ -337,10 +396,12 @@ def stamp_report_identity(
         SET hostname = ?,
             node_role = ?,
             cluster_id = ?,
+            report_set_id = ?,
+            node_id = ?,
             rhosp_version = ?
-        WHERE report_name = ?
+        WHERE report_name = ? AND report_set_id = ?
         """,
-        [hostname, node_role, cluster_id, rhosp_version, report_name],
+        [hostname, node_role, cluster_id, report_set_id, node_id, rhosp_version, report_name, report_set_id],
     )
     conn.execute(
         """
@@ -348,10 +409,21 @@ def stamp_report_identity(
         SET hostname = ?,
             node_role = ?,
             cluster_id = ?,
+            report_set_id = ?,
+            node_id = ?,
             rhosp_version = ?
-        WHERE report_name = ?
+        WHERE report_name = ? AND report_set_id = ?
         """,
-        [hostname, node_role, cluster_id, rhosp_version, report_name],
+        [hostname, node_role, cluster_id, report_set_id, node_id, rhosp_version, report_name, report_set_id],
+    )
+    conn.execute(
+        """
+        UPDATE os_configs
+        SET node_name = ?, node_role = ?, cluster_id = ?, report_set_id = ?,
+            node_id = ?, rhosp_version = ?
+        WHERE report_name = ? AND report_set_id = ?
+        """,
+        [hostname, node_role, cluster_id, report_set_id, node_id, rhosp_version, report_name, report_set_id],
     )
 
 
@@ -427,9 +499,10 @@ def mark_archive_failed(conn: duckdb.DuckDBPyConnection, archive_id: str) -> Non
     )
 
 
-def dedupe_ingested_rows(conn: duckdb.DuckDBPyConnection) -> tuple[int, int]:
+def dedupe_ingested_rows(conn: duckdb.DuckDBPyConnection) -> tuple[int, int, int]:
     before_logs = conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0]
     before_commands = conn.execute("SELECT COUNT(*) FROM os_commands").fetchone()[0]
+    before_configs = conn.execute("SELECT COUNT(*) FROM os_configs").fetchone()[0]
 
     conn.execute(
         """
@@ -438,7 +511,7 @@ def dedupe_ingested_rows(conn: duckdb.DuckDBPyConnection) -> tuple[int, int]:
         FROM (
             SELECT *,
                    row_number() OVER (
-                       PARTITION BY report_name, source_file, timestamp, pid, level,
+                       PARTITION BY report_set_id, report_name, source_file, timestamp, pid, level,
                                     module, message, service
                        ORDER BY report_name
                    ) AS row_num
@@ -458,7 +531,7 @@ def dedupe_ingested_rows(conn: duckdb.DuckDBPyConnection) -> tuple[int, int]:
         FROM (
             SELECT *,
                    row_number() OVER (
-                       PARTITION BY report_name, source_file, command, output
+                       PARTITION BY report_set_id, report_name, source_file, command, output
                        ORDER BY report_name
                    ) AS row_num
             FROM os_commands
@@ -470,9 +543,32 @@ def dedupe_ingested_rows(conn: duckdb.DuckDBPyConnection) -> tuple[int, int]:
     conn.execute("INSERT INTO os_commands SELECT * FROM deduped_os_commands")
     conn.execute("DROP TABLE deduped_os_commands")
 
+    conn.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE deduped_os_configs AS
+        SELECT * EXCLUDE(row_num)
+        FROM (
+            SELECT *, row_number() OVER (
+                PARTITION BY report_set_id, report_name, config_path
+                ORDER BY report_name
+            ) AS row_num
+            FROM os_configs
+        )
+        WHERE row_num = 1
+        """
+    )
+    conn.execute("DELETE FROM os_configs")
+    conn.execute("INSERT INTO os_configs SELECT * FROM deduped_os_configs")
+    conn.execute("DROP TABLE deduped_os_configs")
+
     after_logs = conn.execute("SELECT COUNT(*) FROM os_logs").fetchone()[0]
     after_commands = conn.execute("SELECT COUNT(*) FROM os_commands").fetchone()[0]
-    return int(before_logs - after_logs), int(before_commands - after_commands)
+    after_configs = conn.execute("SELECT COUNT(*) FROM os_configs").fetchone()[0]
+    return (
+        int(before_logs - after_logs),
+        int(before_commands - after_commands),
+        int(before_configs - after_configs),
+    )
 
 
 def insert_logs(conn: duckdb.DuckDBPyConnection, entries: Sequence[LogEntry]) -> int:
@@ -497,6 +593,8 @@ def insert_logs(conn: duckdb.DuckDBPyConnection, entries: Sequence[LogEntry]) ->
             "hostname",
             "node_role",
             "cluster_id",
+            "report_set_id",
+            "node_id",
         ),
         [
             (
@@ -514,6 +612,8 @@ def insert_logs(conn: duckdb.DuckDBPyConnection, entries: Sequence[LogEntry]) ->
                 entry.hostname,
                 entry.node_role,
                 entry.cluster_id,
+                entry.report_set_id,
+                entry.node_id,
             )
             for entry in entries
         ],
@@ -542,6 +642,8 @@ def insert_commands(
             "hostname",
             "node_role",
             "cluster_id",
+            "report_set_id",
+            "node_id",
         ),
         [
             (
@@ -557,7 +659,50 @@ def insert_commands(
                 artifact.hostname,
                 artifact.node_role,
                 artifact.cluster_id,
+                artifact.report_set_id,
+                artifact.node_id,
             )
             for artifact in artifacts
         ],
+    )
+
+
+def insert_configs(
+    conn: duckdb.DuckDBPyConnection, artifacts: Sequence[ConfigArtifact]
+) -> int:
+    if not artifacts:
+        return 0
+    return _copy_rows(
+        conn,
+        "os_configs",
+        (
+            "cluster_id", "report_set_id", "node_id", "node_name", "node_role",
+            "config_path", "config_content", "config_format", "service", "category",
+            "report_name", "rhosp_version",
+        ),
+        [
+            (
+                artifact.cluster_id, artifact.report_set_id, artifact.node_id,
+                artifact.hostname, artifact.node_role, artifact.source_file,
+                _truncate_text(artifact.content), artifact.config_format,
+                artifact.service, artifact.category, artifact.report_name,
+                artifact.rhosp_version,
+            )
+            for artifact in artifacts
+        ],
+    )
+
+
+def create_report_set(
+    conn: duckdb.DuckDBPyConnection,
+    report_set_id: str,
+    cluster_id: str,
+    reports_dir: Path,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO sos_report_sets (report_set_id, cluster_id, reports_dir, ingested_at)
+        VALUES (?, ?, ?, current_timestamp)
+        """,
+        [report_set_id, cluster_id, str(reports_dir)],
     )
